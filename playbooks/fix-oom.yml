@@ -6,7 +6,8 @@
   tasks:
     - name: Patch Deployment with more memory
       kubernetes.core.k8s:
-        # AAP Credential handles host/token/ca automatically
+        # Explicitly ignore SSL verification errors
+        validate_certs: false
         state: patched
         kind: Deployment
         name: "{{ event.payload.alerts[0].labels.app }}"

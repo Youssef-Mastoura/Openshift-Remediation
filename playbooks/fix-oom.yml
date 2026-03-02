@@ -5,8 +5,11 @@
   tasks:
     - name: Patch Deployment with more memory
       kubernetes.core.k8s:
-        # Explicitly tell it to use the local pod credentials
+        # Standard OpenShift pod internal API address
         host: https://kubernetes.default.svc
+        # Explicitly use the token and CA that OpenShift mounts in the pod
+        api_key: "{{ lookup('file', '/var/run/secrets/kubernetes.io/serviceaccount/token') }}"
+        ca_cert: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
         validate_certs: false
         state: patched
         kind: Deployment

@@ -5,9 +5,11 @@
   tasks:
     - name: Patch Deployment with more memory
       kubernetes.core.k8s:
+        # Explicitly tell it to use the local pod credentials
+        host: https://kubernetes.default.svc
+        validate_certs: false
         state: patched
         kind: Deployment
-        # Use the exact path confirmed by your JSON output
         name: "{{ ansible_eda.event.payload.alerts[0].labels.app }}"
         namespace: "ms-demo"
         definition:

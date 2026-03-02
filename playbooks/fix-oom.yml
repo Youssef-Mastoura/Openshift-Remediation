@@ -2,21 +2,25 @@
 - name: Remediation - Scale Up Memory
   hosts: localhost
   connection: local
-  gather_facts: false
   tasks:
     - name: Patch Deployment with more memory
       kubernetes.core.k8s:
+        # Standard OpenShift pod internal API address
+        host: https://kubernetes.default.svc
+        # Explicitly use the token and CA that OpenShift mounts in the pod
+        api_key: "{{ lookup('file', '/var/run/secrets/kubernetes.io/serviceaccount/token') }}"
+        ca_cert: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        validate_certs: false
         state: patched
         kind: Deployment
-        # Accessing the variable passed from the EDA rulebook
-        name: "{{ event.payload.alerts[0].labels.app }}"
+        name: "{{ ansible_eda.event.payload.alerts[0].labels.app }}"
         namespace: "ms-demo"
         definition:
           spec:
             template:
               spec:
                 containers:
-                  - name: "{{ event.payload.alerts[0].labels.app }}"
+                  - name: server
                     resources:
                       limits:
                         memory: "512Mi"

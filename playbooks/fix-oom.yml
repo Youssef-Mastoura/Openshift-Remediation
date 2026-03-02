@@ -7,8 +7,8 @@
       kubernetes.core.k8s:
         state: patched
         kind: Deployment
-        # Use the 'event' variable which is passed by the rulebook
-        name: "{{ event.payload.alerts[0].labels.app }}"
+        # Change 'event' to 'ansible_eda.event'
+        name: "{{ ansible_eda.event.payload.alerts[0].labels.app }}"
         namespace: "ms-demo"
         definition:
           spec:

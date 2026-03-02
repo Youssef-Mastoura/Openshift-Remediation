@@ -6,9 +6,9 @@
   tasks:
     - name: Patch Deployment with more memory
       kubernetes.core.k8s:
-        # No host, api_key, or ca_cert needed if RBAC is set up
         state: patched
         kind: Deployment
+        # Accessing the variable passed from the EDA rulebook
         name: "{{ event.payload.alerts[0].labels.app }}"
         namespace: "ms-demo"
         definition:

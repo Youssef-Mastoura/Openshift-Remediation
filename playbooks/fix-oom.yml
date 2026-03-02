@@ -1,0 +1,21 @@
+---
+- name: Remediation - Scale Up Memory
+  hosts: localhost
+  connection: local
+  tasks:
+    - name: Patch Deployment with more memory
+      kubernetes.core.k8s:
+        state: patched
+        kind: Deployment
+        # The 'ansible_eda' variable is automatically populated by the EDA rulebook
+        name: "{{ ansible_eda.event.payload.alerts[0].labels.app }}"
+        namespace: "ms-demo"
+        definition:
+          spec:
+            template:
+              spec:
+                containers:
+                  - name: server
+                    resources:
+                      limits:
+                        memory: "512Mi"

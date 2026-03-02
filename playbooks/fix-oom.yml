@@ -3,12 +3,16 @@
   hosts: localhost
   connection: local
   tasks:
+    - name: Determine the correct event source
+      set_fact:
+        target_app: "{{ (ansible_eda.event.payload.alerts[0].labels.app | default(event.payload.alerts[0].labels.app)) }}"
+      failed_when: target_app is undefined
+
     - name: Patch Deployment with more memory
       kubernetes.core.k8s:
         state: patched
         kind: Deployment
-        # Change 'event' to 'ansible_eda.event'
-        name: "{{ ansible_eda.event.payload.alerts[0].labels.app }}"
+        name: "{{ target_app }}"
         namespace: "ms-demo"
         definition:
           spec:

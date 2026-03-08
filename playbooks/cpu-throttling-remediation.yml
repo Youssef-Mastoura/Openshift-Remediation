@@ -18,14 +18,8 @@
 
     - name: Query Prometheus for throttled containers
       uri:
-        url: "{{ prometheus_url }}/api/v1/query"
+        url: "{{ prometheus_url }}/api/v1/query?query=rate(container_cpu_cfs_throttled_periods_total%7Bnamespace%3D%22{{ app_namespace }}%22%2Ccontainer%21%3D%22%22%2Ccontainer%21%3D%22POD%22%7D%5B5m%5D)%2Frate(container_cpu_cfs_periods_total%7Bnamespace%3D%22{{ app_namespace }}%22%2Ccontainer%21%3D%22%22%2Ccontainer%21%3D%22POD%22%7D%5B5m%5D)%3E{{ throttling_threshold }}"
         method: GET
-        params:
-          query: >-
-            rate(container_cpu_cfs_throttled_periods_total{namespace="{{ app_namespace }}", container!="", container!="POD"}[5m])
-            /
-            rate(container_cpu_cfs_periods_total{namespace="{{ app_namespace }}", container!="", container!="POD"}[5m])
-            > {{ throttling_threshold }}
         validate_certs: false
         return_content: true
       register: prometheus_response

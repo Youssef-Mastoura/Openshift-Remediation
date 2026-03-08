@@ -1,0 +1,76 @@
+---
+- name: ConfigMap Desync Remediation
+  hosts: localhost
+  connection: local
+  gather_facts: true
+
+  vars:
+    namespace: ms-demo
+    configmap_name: productcatalog-config
+    deployment_name: productcatalogservice
+    known_good_value: "10"
+
+  tasks:
+
+    - name: Log remediation start
+      debug:
+        msg: "ConfigMap desync detected — restoring productcatalog-config to last known good value and restarting pods"
+
+    - name: Restore ConfigMap to last known good value
+      kubernetes.core.k8s:
+        validate_certs: false
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: "{{ configmap_name }}"
+            namespace: "{{ namespace }}"
+          data:
+            MAX_PRODUCTS_RETURN: "{{ known_good_value }}"
+
+    - name: Verify ConfigMap was restored
+      kubernetes.core.k8s_info:
+        kind: ConfigMap
+        name: "{{ configmap_name }}"
+        namespace: "{{ namespace }}"
+        validate_certs: false
+      register: configmap_check
+
+    - name: Log restored value
+      debug:
+        msg: "ConfigMap restored — MAX_PRODUCTS_RETURN is now {{ configmap_check.resources[0].data.MAX_PRODUCTS_RETURN }}"
+
+    - name: Trigger rolling restart to reload new ConfigMap value
+      kubernetes.core.k8s:
+        validate_certs: false
+        state: patched
+        kind: Deployment
+        name: "{{ deployment_name }}"
+        namespace: "{{ namespace }}"
+        definition:
+          spec:
+            template:
+              metadata:
+                annotations:
+                  kubectl.kubernetes.io/restartedAt: "{{ ansible_date_time.iso8601 }}"
+
+    - name: Wait for rolling restart to complete
+      kubernetes.core.k8s_info:
+        kind: Deployment
+        name: "{{ deployment_name }}"
+        namespace: "{{ namespace }}"
+        validate_certs: false
+      register: rollout_status
+      until: >
+        rollout_status.resources[0].status.updatedReplicas is defined and
+        rollout_status.resources[0].status.updatedReplicas ==
+        rollout_status.resources[0].spec.replicas and
+        rollout_status.resources[0].status.readyReplicas ==
+        rollout_status.resources[0].spec.replicas
+      retries: 15
+      delay: 10
+
+    - name: Log remediation complete
+      debug:
+        msg: "Remediation complete — productcatalogservice restarted with restored ConfigMap value"

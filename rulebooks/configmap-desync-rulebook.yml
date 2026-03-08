@@ -4,8 +4,7 @@
   sources:
     - ansible.eda.alertmanager:
         host: 0.0.0.0
-        port: 9001
-
+        port: 5000
   rules:
     - name: Handle ConfigMap Desync Alert
       condition: event.payload.alerts[0].labels.alertname == "ConfigMapDesync"

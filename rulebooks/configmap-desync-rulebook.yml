@@ -1,17 +1,29 @@
 ---
-- name: ConfigMap Desync Remediation Rulebook
+- name: Unified OpenShift Remediation Rulebook
   hosts: all
   sources:
-    - ansible.eda.alertmanager:
+    - ansible.eda.webhook:
         host: 0.0.0.0
         port: 5000
+
   rules:
-    - name: Handle ConfigMap Desync Alert
-      condition: event.payload.alerts[0].labels.alertname == "ConfigMapDesync"
+
+    - name: Trigger OOMKilled Fix
+      condition: event.payload.alerts is selectattr("labels.remediation", "==", "increase-mem")
+      action:
+        run_job_template:
+          name: "Fix OOM Template"
+          organization: "Default"
+          job_args:
+            extra_vars:
+              event: "{{ event }}"
+
+    - name: Trigger ConfigMap Desync Fix
+      condition: event.payload.alerts is selectattr("labels.remediation", "==", "configmap-desync")
       action:
         run_job_template:
           name: "configmap-desync-remediation"
           organization: "Default"
           job_args:
             extra_vars:
-              alert_data: "{{ event.payload }}"
+              event: "{{ event }}"

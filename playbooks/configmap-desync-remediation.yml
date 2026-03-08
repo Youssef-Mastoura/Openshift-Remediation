@@ -5,40 +5,48 @@
   gather_facts: true
 
   vars:
-    namespace: ms-demo
+    app_namespace: ms-demo
 
   tasks:
 
     - name: Log remediation start
       debug:
-        msg: "ConfigMap desync alert fired in {{ namespace }} — scanning for affected deployments via ConfigMap labels"
+        msg: "ConfigMap desync alert fired in {{ app_namespace }} — scanning for affected deployments via ConfigMap labels"
 
-    - name: Get all ConfigMaps in namespace that have the managed-by-deployment label
+    - name: Get all ConfigMaps with managed-by-deployment label
       kubernetes.core.k8s_info:
         kind: ConfigMap
-        namespace: "{{ namespace }}"
+        namespace: "{{ app_namespace }}"
         validate_certs: false
         label_selectors:
           - "managed-by-deployment"
       register: labeled_configmaps
 
-    - name: Extract deployment names and their configmap names from labels
+    - name: Extract configmap and deployment pairs using Jinja2
       set_fact:
         configmap_deployment_pairs: >-
-          {{ labeled_configmaps.resources
-             | map(attribute='metadata')
-             | map('community.general.json_query',
-                   '{configmap: name, deployment: labels."managed-by-deployment"}')
-             | list }}
+          {{ labeled_configmaps.resources | map(attribute='metadata') | list
+             | map('combine', {}) | list }}
+
+    - name: Build clean pairs list
+      set_fact:
+        clean_pairs: >-
+          {{ clean_pairs | default([]) + [
+            {
+              'configmap': item.name,
+              'deployment': item.labels['managed-by-deployment']
+            }
+          ] }}
+      loop: "{{ configmap_deployment_pairs }}"
 
     - name: Log pairs found
       debug:
-        msg: "Found ConfigMap-Deployment pairs: {{ configmap_deployment_pairs }}"
+        msg: "Found ConfigMap-Deployment pairs: {{ clean_pairs }}"
 
     - name: Fail gracefully if no labeled ConfigMaps found
       fail:
-        msg: "No ConfigMaps with label managed-by-deployment found in {{ namespace }}. Nothing to remediate."
-      when: configmap_deployment_pairs | length == 0
+        msg: "No ConfigMaps with label managed-by-deployment found in {{ app_namespace }}. Nothing to remediate."
+      when: clean_pairs | length == 0
 
     - name: Restore annotation on each ConfigMap to mark remediation time
       kubernetes.core.k8s:
@@ -46,12 +54,12 @@
         state: patched
         kind: ConfigMap
         name: "{{ item.configmap }}"
-        namespace: "{{ namespace }}"
+        namespace: "{{ app_namespace }}"
         definition:
           metadata:
             annotations:
               remediation/restored-at: "{{ ansible_date_time.iso8601 }}"
-      loop: "{{ configmap_deployment_pairs }}"
+      loop: "{{ clean_pairs }}"
 
     - name: Trigger rolling restart on each affected deployment
       kubernetes.core.k8s:
@@ -59,20 +67,20 @@
         state: patched
         kind: Deployment
         name: "{{ item.deployment }}"
-        namespace: "{{ namespace }}"
+        namespace: "{{ app_namespace }}"
         definition:
           spec:
             template:
               metadata:
                 annotations:
                   kubectl.kubernetes.io/restartedAt: "{{ ansible_date_time.iso8601 }}"
-      loop: "{{ configmap_deployment_pairs }}"
+      loop: "{{ clean_pairs }}"
 
     - name: Wait for each affected deployment to finish rolling restart
       kubernetes.core.k8s_info:
         kind: Deployment
         name: "{{ item.deployment }}"
-        namespace: "{{ namespace }}"
+        namespace: "{{ app_namespace }}"
         validate_certs: false
       register: rollout_status
       until: >
@@ -81,8 +89,8 @@
         rollout_status.resources[0].spec.replicas
       retries: 15
       delay: 10
-      loop: "{{ configmap_deployment_pairs }}"
+      loop: "{{ clean_pairs }}"
 
     - name: Log remediation complete
       debug:
-        msg: "Remediation complete — rolling restart triggered for all affected deployments"
+        msg: "Remediation complete — rolling restart triggered for: {{ clean_pairs | map(attribute='deployment') | list }}"

@@ -1,52 +1,64 @@
 ---
-- name: ConfigMap Desync Remediation
+- name: ConfigMap Desync Dynamic Remediation
   hosts: localhost
   connection: local
   gather_facts: true
 
   vars:
     namespace: ms-demo
-    configmap_name: productcatalog-config
-    deployment_name: productcatalogservice
-    known_good_value: "10"
 
   tasks:
 
     - name: Log remediation start
       debug:
-        msg: "ConfigMap desync detected — restoring productcatalog-config to last known good value and restarting pods"
+        msg: "ConfigMap desync alert fired in {{ namespace }} — scanning for affected deployments via ConfigMap labels"
 
-    - name: Restore ConfigMap to last known good value
-      kubernetes.core.k8s:
-        validate_certs: false
-        state: present
-        definition:
-          apiVersion: v1
-          kind: ConfigMap
-          metadata:
-            name: "{{ configmap_name }}"
-            namespace: "{{ namespace }}"
-          data:
-            MAX_PRODUCTS_RETURN: "{{ known_good_value }}"
-
-    - name: Verify ConfigMap was restored
+    - name: Get all ConfigMaps in namespace that have the managed-by-deployment label
       kubernetes.core.k8s_info:
         kind: ConfigMap
-        name: "{{ configmap_name }}"
         namespace: "{{ namespace }}"
         validate_certs: false
-      register: configmap_check
+        label_selectors:
+          - "managed-by-deployment"
+      register: labeled_configmaps
 
-    - name: Log restored value
+    - name: Extract deployment names and their configmap names from labels
+      set_fact:
+        configmap_deployment_pairs: >-
+          {{ labeled_configmaps.resources
+             | map(attribute='metadata')
+             | map('community.general.json_query',
+                   '{configmap: name, deployment: labels."managed-by-deployment"}')
+             | list }}
+
+    - name: Log pairs found
       debug:
-        msg: "ConfigMap restored — MAX_PRODUCTS_RETURN is now {{ configmap_check.resources[0].data.MAX_PRODUCTS_RETURN }}"
+        msg: "Found ConfigMap-Deployment pairs: {{ configmap_deployment_pairs }}"
 
-    - name: Trigger rolling restart to reload new ConfigMap value
+    - name: Fail gracefully if no labeled ConfigMaps found
+      fail:
+        msg: "No ConfigMaps with label managed-by-deployment found in {{ namespace }}. Nothing to remediate."
+      when: configmap_deployment_pairs | length == 0
+
+    - name: Restore annotation on each ConfigMap to mark remediation time
+      kubernetes.core.k8s:
+        validate_certs: false
+        state: patched
+        kind: ConfigMap
+        name: "{{ item.configmap }}"
+        namespace: "{{ namespace }}"
+        definition:
+          metadata:
+            annotations:
+              remediation/restored-at: "{{ ansible_date_time.iso8601 }}"
+      loop: "{{ configmap_deployment_pairs }}"
+
+    - name: Trigger rolling restart on each affected deployment
       kubernetes.core.k8s:
         validate_certs: false
         state: patched
         kind: Deployment
-        name: "{{ deployment_name }}"
+        name: "{{ item.deployment }}"
         namespace: "{{ namespace }}"
         definition:
           spec:
@@ -54,23 +66,23 @@
               metadata:
                 annotations:
                   kubectl.kubernetes.io/restartedAt: "{{ ansible_date_time.iso8601 }}"
+      loop: "{{ configmap_deployment_pairs }}"
 
-    - name: Wait for rolling restart to complete
+    - name: Wait for each affected deployment to finish rolling restart
       kubernetes.core.k8s_info:
         kind: Deployment
-        name: "{{ deployment_name }}"
+        name: "{{ item.deployment }}"
         namespace: "{{ namespace }}"
         validate_certs: false
       register: rollout_status
       until: >
-        rollout_status.resources[0].status.updatedReplicas is defined and
-        rollout_status.resources[0].status.updatedReplicas ==
-        rollout_status.resources[0].spec.replicas and
+        rollout_status.resources[0].status.readyReplicas is defined and
         rollout_status.resources[0].status.readyReplicas ==
         rollout_status.resources[0].spec.replicas
       retries: 15
       delay: 10
+      loop: "{{ configmap_deployment_pairs }}"
 
     - name: Log remediation complete
       debug:
-        msg: "Remediation complete — productcatalogservice restarted with restored ConfigMap value"
+        msg: "Remediation complete — rolling restart triggered for all affected deployments"

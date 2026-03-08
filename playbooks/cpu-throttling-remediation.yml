@@ -7,103 +7,53 @@
   vars:
     app_namespace: ms-demo
     new_cpu_limit: "300m"
-    prometheus_url: "https://prometheus-k8s.openshift-monitoring.svc.cluster.local:9091"
-    throttling_threshold: "0.25"
 
   tasks:
 
     - name: Log remediation start
       debug:
-        msg: "CPU throttling alert fired in {{ app_namespace }} — querying Prometheus to find throttled containers"
+        msg: "Throttling detected on pod={{ throttled_pod }} container={{ throttled_container }}"
 
-    - name: Get Prometheus service account token
-      shell: cat /var/run/secrets/kubernetes.io/serviceaccount/token
-      register: sa_token
-
-    - name: Query Prometheus for throttled containers
-      uri:
-        url: "{{ prometheus_url }}/api/v1/query?query=rate(container_cpu_cfs_throttled_periods_total%7Bnamespace%3D%22{{ app_namespace }}%22%2Ccontainer%21%3D%22%22%2Ccontainer%21%3D%22POD%22%7D%5B5m%5D)%2Frate(container_cpu_cfs_periods_total%7Bnamespace%3D%22{{ app_namespace }}%22%2Ccontainer%21%3D%22%22%2Ccontainer%21%3D%22POD%22%7D%5B5m%5D)%3E{{ throttling_threshold }}"
-        method: GET
-        validate_certs: false
-        return_content: true
-        headers:
-          Authorization: "Bearer {{ sa_token.stdout }}"
-      register: prometheus_response
-
-    - name: Parse throttled containers from Prometheus response
-      set_fact:
-        throttled_containers: >-
-          {{ prometheus_response.json.data.result
-             | map(attribute='metric')
-             | list }}
-
-    - name: Log throttled containers found
-      debug:
-        msg: "Throttled containers: {{ throttled_containers }}"
-
-    - name: Fail gracefully if no throttled containers found
-      fail:
-        msg: "No throttled containers found above threshold. Nothing to remediate."
-      when: throttled_containers | length == 0
-
-    - name: Get pod info for each throttled container
+    - name: Get pod info
       kubernetes.core.k8s_info:
         kind: Pod
-        name: "{{ item.pod }}"
+        name: "{{ throttled_pod }}"
         namespace: "{{ app_namespace }}"
         validate_certs: false
-      register: pod_infos
-      loop: "{{ throttled_containers }}"
+      register: pod_info
 
-    - name: Extract replicaset names from pod owner references
+    - name: Extract ReplicaSet name
       set_fact:
-        replicaset_names: >-
-          {{ replicaset_names | default([]) + [
-            {
-              'replicaset': item.resources[0].metadata.ownerReferences
-                | selectattr('kind', '==', 'ReplicaSet')
-                | map(attribute='name')
-                | first,
-              'container': item.resources[0].spec.containers[0].name
-            }
-          ] }}
-      loop: "{{ pod_infos.results }}"
+        replicaset_name: >-
+          {{ pod_info.resources[0].metadata.ownerReferences
+             | selectattr('kind', '==', 'ReplicaSet')
+             | map(attribute='name') | first }}
 
-    - name: Get ReplicaSet info to find Deployment names
+    - name: Get ReplicaSet info
       kubernetes.core.k8s_info:
         kind: ReplicaSet
-        name: "{{ item.replicaset }}"
+        name: "{{ replicaset_name }}"
         namespace: "{{ app_namespace }}"
         validate_certs: false
-      register: rs_infos
-      loop: "{{ replicaset_names }}"
+      register: rs_info
 
-    - name: Extract deployment names
+    - name: Extract Deployment name
       set_fact:
-        deployment_targets: >-
-          {{ deployment_targets | default([]) + [
-            {
-              'deployment': item.resources[0].metadata.ownerReferences
-                | selectattr('kind', '==', 'Deployment')
-                | map(attribute='name')
-                | first,
-              'container': replicaset_names[idx].container
-            }
-          ] }}
-      loop: "{{ rs_infos.results }}"
-      loop_control:
-        index_var: idx
+        deployment_name: >-
+          {{ rs_info.resources[0].metadata.ownerReferences
+             | selectattr('kind', '==', 'Deployment')
+             | map(attribute='name') | first }}
 
-    - name: Log deployment targets
+    - name: Log deployment found
       debug:
-        msg: "Deployment targets to remediate: {{ deployment_targets }}"
+        msg: "Patching deployment: {{ deployment_name }}"
 
-    - name: Increase CPU limit on throttled deployments only
+    - name: Increase CPU limit on throttled deployment only
       kubernetes.core.k8s:
         validate_certs: false
         state: patched
         kind: Deployment
-        name: "{{ item.deployment }}"
+        name: "{{ deployment_name }}"
         namespace: "{{ app_namespace }}"
         definition:
           metadata:
@@ -113,12 +63,11 @@
             template:
               spec:
                 containers:
-                  - name: "{{ item.container }}"
+                  - name: "{{ throttled_container }}"
                     resources:
                       limits:
                         cpu: "{{ new_cpu_limit }}"
-      loop: "{{ deployment_targets }}"
 
     - name: Log remediation complete
       debug:
-        msg: "CPU limit increased to {{ new_cpu_limit }} on: {{ deployment_targets | map(attribute='deployment') | list }}"
+        msg: "CPU limit increased to {{ new_cpu_limit }} on {{ deployment_name }}/{{ throttled_container }}"

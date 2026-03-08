@@ -1,18 +1,17 @@
 ---
-- name: Ephemeral Storage Exhaustion Remediation
+- name: Ephemeral Storage Exhaustion Reactive Remediation
   hosts: localhost
   connection: local
   gather_facts: true
 
   vars:
     app_namespace: ms-demo
-    storage_threshold_bytes: 89128960
 
   tasks:
 
     - name: Log remediation start
       debug:
-        msg: "Ephemeral storage exhaustion alert fired in {{ app_namespace }} — scanning for affected containers"
+        msg: "Ephemeral storage eviction detected in {{ app_namespace }} — scanning for evicted pods"
 
     - name: Get all pods in namespace
       kubernetes.core.k8s_info:
@@ -21,66 +20,33 @@
         validate_certs: false
       register: all_pods
 
-    - name: Build list of running pods
+    - name: Build list of evicted pods
       set_fact:
-        running_pods: >-
+        evicted_pods: >-
           {{ all_pods.resources
-             | selectattr('status.phase', '==', 'Running')
+             | selectattr('status.reason', 'defined')
+             | selectattr('status.reason', '==', 'Evicted')
              | map(attribute='metadata.name')
              | list }}
 
-    - name: Log running pods found
+    - name: Log evicted pods found
       debug:
-        msg: "Running pods in {{ app_namespace }}: {{ running_pods }}"
+        msg: "Evicted pods found: {{ evicted_pods }}"
 
-    - name: Delete large temp files in each running pod
-      kubernetes.core.k8s_exec:
-        namespace: "{{ app_namespace }}"
-        pod: "{{ item }}"
-        command: >
-          sh -c "find /tmp -type f -size +50M -delete 2>/dev/null;
-                 find /var/log -type f -size +50M -delete 2>/dev/null;
-                 echo cleaned"
-        validate_certs: false
-      register: cleanup_result
-      ignore_errors: true
-      loop: "{{ running_pods }}"
+    - name: Fail gracefully if no evicted pods found
+      fail:
+        msg: "No evicted pods found in {{ app_namespace }}. Nothing to remediate."
+      when: evicted_pods | length == 0
 
-    - name: Log cleanup results
-      debug:
-        msg: "Cleanup on {{ item.item }}: {{ item.stdout | default('no output') }}"
-      loop: "{{ cleanup_result.results }}"
-
-    - name: Get all deployments in namespace
-      kubernetes.core.k8s_info:
-        kind: Deployment
-        namespace: "{{ app_namespace }}"
-        validate_certs: false
-      register: all_deployments
-
-    - name: Trigger rolling restart on all deployments to reset ephemeral storage
+    - name: Delete each evicted pod so Kubernetes recreates it clean
       kubernetes.core.k8s:
         validate_certs: false
-        state: patched
-        kind: Deployment
-        name: "{{ item.metadata.name }}"
+        state: absent
+        kind: Pod
+        name: "{{ item }}"
         namespace: "{{ app_namespace }}"
-        definition:
-          metadata:
-            annotations:
-              remediation/ephemeral-storage-cleared-at: "{{ ansible_date_time.iso8601 }}"
-          spec:
-            template:
-              metadata:
-                annotations:
-                  kubectl.kubernetes.io/restartedAt: "{{ ansible_date_time.iso8601 }}"
-      loop: "{{ all_deployments.resources }}"
-      when: >
-        item.metadata.name in (cleanup_result.results
-        | selectattr('stdout', 'defined')
-        | selectattr('stdout', 'search', 'cleaned')
-        | map(attribute='item') | list)
+      loop: "{{ evicted_pods }}"
 
     - name: Log remediation complete
       debug:
-        msg: "Ephemeral storage remediation complete in {{ app_namespace }}"
+        msg: "Deleted evicted pods: {{ evicted_pods }} — Kubernetes will recreate them clean"

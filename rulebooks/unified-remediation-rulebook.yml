@@ -28,4 +28,12 @@
             extra_vars:
               event: "{{ event }}"
               
-
+    - name: Trigger CPU Throttling Fix
+      condition: event.payload.alerts is selectattr("labels.remediation", "==", "cpu-throttling")
+      action:
+        run_job_template:
+          name: "cpu-throttling-remediation"
+          organization: "Default"
+          job_args:
+            extra_vars:
+              event: "{{ event }}"

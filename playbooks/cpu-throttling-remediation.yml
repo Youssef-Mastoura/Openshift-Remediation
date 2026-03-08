@@ -6,39 +6,56 @@
 
   vars:
     app_namespace: ms-demo
-    throttling_threshold: "0.25"
     new_cpu_limit: "300m"
 
   tasks:
 
     - name: Log remediation start
       debug:
-        msg: "CPU throttling alert fired in {{ app_namespace }} — identifying throttled containers"
+        msg: "CPU throttling detected on pod {{ throttled_pod }} container {{ throttled_container }} — increasing CPU limit"
 
-    - name: Get all deployments in namespace
+    - name: Get the deployment name from the pod
       kubernetes.core.k8s_info:
-        kind: Deployment
+        kind: Pod
+        name: "{{ throttled_pod }}"
         namespace: "{{ app_namespace }}"
         validate_certs: false
-      register: all_deployments
+      register: pod_info
 
-    - name: Build list of deployment names
+    - name: Extract deployment name from pod owner references
       set_fact:
-        deployment_names: >-
-          {{ all_deployments.resources
-             | map(attribute='metadata.name')
-             | list }}
+        replicaset_name: >-
+          {{ pod_info.resources[0].metadata.ownerReferences
+             | selectattr('kind', '==', 'ReplicaSet')
+             | map(attribute='name')
+             | first }}
 
-    - name: Log deployments found
+    - name: Get ReplicaSet to find Deployment name
+      kubernetes.core.k8s_info:
+        kind: ReplicaSet
+        name: "{{ replicaset_name }}"
+        namespace: "{{ app_namespace }}"
+        validate_certs: false
+      register: rs_info
+
+    - name: Extract deployment name
+      set_fact:
+        deployment_name: >-
+          {{ rs_info.resources[0].metadata.ownerReferences
+             | selectattr('kind', '==', 'Deployment')
+             | map(attribute='name')
+             | first }}
+
+    - name: Log deployment found
       debug:
-        msg: "Deployments in {{ app_namespace }}: {{ deployment_names }}"
+        msg: "Throttled container belongs to Deployment: {{ deployment_name }}"
 
-    - name: Increase CPU limit on all deployments that have a CPU limit set
+    - name: Increase CPU limit on the throttled deployment only
       kubernetes.core.k8s:
         validate_certs: false
         state: patched
         kind: Deployment
-        name: "{{ item.metadata.name }}"
+        name: "{{ deployment_name }}"
         namespace: "{{ app_namespace }}"
         definition:
           metadata:
@@ -48,15 +65,11 @@
             template:
               spec:
                 containers:
-                  - name: "{{ item.spec.template.spec.containers[0].name }}"
+                  - name: "{{ throttled_container }}"
                     resources:
                       limits:
                         cpu: "{{ new_cpu_limit }}"
-      loop: "{{ all_deployments.resources }}"
-      when: >
-        item.spec.template.spec.containers[0].resources.limits is defined and
-        item.spec.template.spec.containers[0].resources.limits.cpu is defined
 
     - name: Log remediation complete
       debug:
-        msg: "CPU limits increased to {{ new_cpu_limit }} on all deployments with CPU limits in {{ app_namespace }}"
+        msg: "CPU limit increased to {{ new_cpu_limit }} on deployment {{ deployment_name }} container {{ throttled_container }}"

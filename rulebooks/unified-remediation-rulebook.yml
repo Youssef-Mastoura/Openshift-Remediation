@@ -27,3 +27,13 @@
           job_args:
             extra_vars:
               event: "{{ event }}"
+              
+    - name: Trigger Ephemeral Storage Fix
+      condition: event.payload.alerts is selectattr("labels.remediation", "==", "ephemeral-storage-exhaustion")
+      action:
+        run_job_template:
+          name: "ephemeral-storage-remediation"
+          organization: "Default"
+          job_args:
+            extra_vars:
+              event: "{{ event }}"

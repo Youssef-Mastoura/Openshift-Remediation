@@ -36,6 +36,5 @@
           organization: "Default"
           job_args:
             extra_vars:
-              event: "{{ event }}"
               throttled_pod: "{{ event.payload.alerts[0].labels.pod }}"
               throttled_container: "{{ event.payload.alerts[0].labels.container }}"

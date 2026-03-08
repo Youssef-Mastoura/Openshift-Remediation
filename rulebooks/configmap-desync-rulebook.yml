@@ -1,0 +1,18 @@
+---
+- name: ConfigMap Desync Remediation Rulebook
+  hosts: all
+  sources:
+    - ansible.eda.alertmanager:
+        host: 0.0.0.0
+        port: 9001
+
+  rules:
+    - name: Handle ConfigMap Desync Alert
+      condition: event.payload.alerts[0].labels.alertname == "ConfigMapDesync"
+      action:
+        run_job_template:
+          name: "configmap-desync-remediation"
+          organization: "Default"
+          job_args:
+            extra_vars:
+              alert_data: "{{ event.payload }}"

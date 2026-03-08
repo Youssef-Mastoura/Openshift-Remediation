@@ -7,7 +7,7 @@
   vars:
     app_namespace: ms-demo
     new_cpu_limit: "300m"
-    prometheus_url: "http://prometheus-operated.openshift-user-workload-monitoring.svc.cluster.local:9090"
+    prometheus_url: "https://prometheus-k8s.openshift-monitoring.svc.cluster.local:9091"
     throttling_threshold: "0.25"
 
   tasks:
@@ -16,12 +16,18 @@
       debug:
         msg: "CPU throttling alert fired in {{ app_namespace }} — querying Prometheus to find throttled containers"
 
+    - name: Get Prometheus service account token
+      shell: cat /var/run/secrets/kubernetes.io/serviceaccount/token
+      register: sa_token
+
     - name: Query Prometheus for throttled containers
       uri:
         url: "{{ prometheus_url }}/api/v1/query?query=rate(container_cpu_cfs_throttled_periods_total%7Bnamespace%3D%22{{ app_namespace }}%22%2Ccontainer%21%3D%22%22%2Ccontainer%21%3D%22POD%22%7D%5B5m%5D)%2Frate(container_cpu_cfs_periods_total%7Bnamespace%3D%22{{ app_namespace }}%22%2Ccontainer%21%3D%22%22%2Ccontainer%21%3D%22POD%22%7D%5B5m%5D)%3E{{ throttling_threshold }}"
         method: GET
         validate_certs: false
         return_content: true
+        headers:
+          Authorization: "Bearer {{ sa_token.stdout }}"
       register: prometheus_response
 
     - name: Parse throttled containers from Prometheus response

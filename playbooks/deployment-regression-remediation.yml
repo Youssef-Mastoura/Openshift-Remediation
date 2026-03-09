@@ -2,7 +2,7 @@
 - name: Deployment Regression Remediation
   hosts: localhost
   connection: local
-  gather_facts: true
+  gather_facts: false
   vars:
     app_namespace: ms-demo
     regression_window_minutes: 5
@@ -10,6 +10,18 @@
     - name: Log remediation start
       debug:
         msg: "Deployment regression detected in {{ app_namespace }} — finding recently deployed services"
+
+    - name: Get cutoff epoch (now minus window)
+      command: "date -u -d '-{{ regression_window_minutes }} minutes' +%s"
+      register: cutoff_epoch
+
+    - name: Get current epoch
+      command: "date -u +%s"
+      register: current_epoch
+
+    - name: Log time window
+      debug:
+        msg: "Cutoff: {{ cutoff_epoch.stdout }} | Now: {{ current_epoch.stdout }}"
 
     - name: Get all ReplicaSets in namespace
       kubernetes.core.k8s_info:
@@ -29,9 +41,10 @@
           }}
       loop: "{{ all_replicasets.resources | selectattr('metadata.ownerReferences', 'defined') | list }}"
       when: >-
-        (now(utc=true) -
-         (item.metadata.creationTimestamp | to_datetime('%Y-%m-%dT%H:%M:%SZ'))).total_seconds()
-        <= (regression_window_minutes | int * 60)
+        item.metadata.creationTimestamp
+        | to_datetime('%Y-%m-%dT%H:%M:%SZ')
+        | strftime('%s') | int
+        >= cutoff_epoch.stdout | int
 
     - name: Remove duplicate deployment names
       set_fact:

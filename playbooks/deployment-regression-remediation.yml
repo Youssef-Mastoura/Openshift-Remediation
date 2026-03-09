@@ -30,14 +30,14 @@
       register: rs_epoch_results
       changed_when: false
 
-    - name: Build list of recent deployments to roll back
+    - name: Build list of recent RS to roll back
       set_fact:
-        deployments_to_rollback: >-
-          {{ deployments_to_rollback | default([]) +
-             [item.item.metadata.ownerReferences
-              | selectattr('kind', '==', 'Deployment')
-              | map(attribute='name')
-              | first]
+        recent_rs_list: >-
+          {{ recent_rs_list | default([]) +
+             [{'deployment': item.item.metadata.ownerReferences
+                             | selectattr('kind', '==', 'Deployment')
+                             | map(attribute='name') | first,
+               'rs_name': item.item.metadata.name}]
           }}
       loop: "{{ rs_epoch_results.results }}"
       loop_control:
@@ -46,7 +46,7 @@
 
     - name: Remove duplicate deployment names
       set_fact:
-        deployments_to_rollback: "{{ deployments_to_rollback | default([]) | unique }}"
+        deployments_to_rollback: "{{ recent_rs_list | default([]) | map(attribute='deployment') | list | unique }}"
 
     - name: Fail gracefully if no recent deployments found
       fail:
@@ -57,22 +57,86 @@
       debug:
         msg: "Deployments to roll back: {{ deployments_to_rollback }}"
 
-    - name: Roll back each regressed deployment
-      command: "oc rollout undo deployment/{{ item }} -n {{ app_namespace }}"
+    - name: Get all ReplicaSets for each affected deployment to find previous good RS
+      kubernetes.core.k8s_info:
+        kind: ReplicaSet
+        namespace: "{{ app_namespace }}"
+        label_selectors:
+          - "app={{ item }}"
+        validate_certs: false
       loop: "{{ deployments_to_rollback }}"
-      register: rollback_results
+      register: deployment_rs_infos
 
-    - name: Log rollback results
+    - name: Find previous good RS image for each deployment
+      set_fact:
+        rollback_targets: >-
+          {{ rollback_targets | default([]) +
+             [{'deployment': item.item,
+               'image': item.resources
+                        | sort(attribute='metadata.creationTimestamp')
+                        | selectattr('spec.replicas', 'equalto', 0)
+                        | map(attribute='spec.template.spec.containers')
+                        | list | last | first
+                        | json_query('image')}]
+          }}
+      loop: "{{ deployment_rs_infos.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Log rollback targets
       debug:
-        msg: "Rolled back {{ item.item }}: {{ item.stdout }}"
-      loop: "{{ rollback_results.results }}"
+        msg: "Rolling back {{ item.deployment }} to image {{ item.image }}"
+      loop: "{{ rollback_targets }}"
 
-    - name: Wait for rollback to complete
-      command: "oc rollout status deployment/{{ item }} -n {{ app_namespace }} --timeout=120s"
-      loop: "{{ deployments_to_rollback }}"
-      register: rollout_statuses
+    - name: Patch deployment with previous good image
+      kubernetes.core.k8s:
+        validate_certs: false
+        state: patched
+        kind: Deployment
+        name: "{{ item.deployment }}"
+        namespace: "{{ app_namespace }}"
+        definition:
+          metadata:
+            annotations:
+              remediation/regression-rolled-back-at: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+          spec:
+            template:
+              spec:
+                containers:
+                  - name: server
+                    image: "{{ item.image }}"
+      loop: "{{ rollback_targets }}"
+      loop_control:
+        label: "{{ item.deployment }}"
+      register: patch_results
+
+    - name: Log patch results
+      debug:
+        msg: "Patched {{ item.item.deployment }}: changed={{ item.changed }}"
+      loop: "{{ patch_results.results }}"
+      loop_control:
+        label: "{{ item.item.deployment }}"
+
+    - name: Wait for rollout to complete
+      kubernetes.core.k8s_info:
+        kind: Deployment
+        name: "{{ item.deployment }}"
+        namespace: "{{ app_namespace }}"
+        validate_certs: false
+      loop: "{{ rollback_targets }}"
+      loop_control:
+        label: "{{ item.deployment }}"
+      register: rollout_check
+      until: >-
+        rollout_check.resources[0].status.readyReplicas is defined and
+        rollout_check.resources[0].status.readyReplicas ==
+        rollout_check.resources[0].spec.replicas
+      retries: 12
+      delay: 10
 
     - name: Log final status
       debug:
-        msg: "Rollback complete for {{ item.item }}: {{ item.stdout }}"
-      loop: "{{ rollout_statuses.results }}"
+        msg: "Rollback complete for {{ item.item.deployment }} — readyReplicas={{ item.resources[0].status.readyReplicas }}"
+      loop: "{{ rollout_check.results }}"
+      loop_control:
+        label: "{{ item.item.deployment }}"

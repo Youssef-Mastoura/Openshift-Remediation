@@ -6,7 +6,6 @@
 
   vars:
     app_namespace: ms-demo
-    new_cpu_limit: "300m"
 
   tasks:
 
@@ -53,11 +52,36 @@
              | selectattr('kind', '==', 'Deployment')
              | map(attribute='name') | first }}
 
-    - name: Log deployment found
-      debug:
-        msg: "Patching deployment: {{ deployment_name }}"
+    - name: Get Deployment info
+      kubernetes.core.k8s_info:
+        kind: Deployment
+        name: "{{ deployment_name }}"
+        namespace: "{{ app_namespace }}"
+        validate_certs: false
+      register: deployment_info
 
-    - name: Increase CPU limit on throttled deployment only
+    - name: Extract current CPU limit
+      set_fact:
+        current_cpu_limit_raw: >-
+          {{ deployment_info.resources[0].spec.template.spec.containers
+             | selectattr('name', '==', throttled_container)
+             | map(attribute='resources.limits.cpu')
+             | first }}
+
+    - name: Convert CPU limit to millicores integer
+      set_fact:
+        current_cpu_millicores: >-
+          {{ current_cpu_limit_raw | regex_replace('m', '') | int }}
+
+    - name: Calculate new CPU limit (current x 1.5)
+      set_fact:
+        new_cpu_limit: "{{ (current_cpu_millicores | int * 1.5) | int }}m"
+
+    - name: Log deployment and CPU values
+      debug:
+        msg: "Deployment={{ deployment_name }} current={{ current_cpu_limit_raw }} new={{ new_cpu_limit }}"
+
+    - name: Increase CPU limit by 1.5x on throttled deployment
       kubernetes.core.k8s:
         validate_certs: false
         state: patched
@@ -79,4 +103,4 @@
 
     - name: Log remediation complete
       debug:
-        msg: "CPU limit increased to {{ new_cpu_limit }} on {{ deployment_name }}/{{ throttled_container }}"
+        msg: "CPU limit increased from {{ current_cpu_limit_raw }} to {{ new_cpu_limit }} on {{ deployment_name }}/{{ throttled_container }}"

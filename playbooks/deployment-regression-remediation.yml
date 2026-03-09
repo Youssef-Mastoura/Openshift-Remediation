@@ -57,7 +57,7 @@
       debug:
         msg: "Deployments to roll back: {{ deployments_to_rollback }}"
 
-    - name: Get all ReplicaSets for each affected deployment to find previous good RS
+    - name: Get all ReplicaSets for each affected deployment
       kubernetes.core.k8s_info:
         kind: ReplicaSet
         namespace: "{{ app_namespace }}"
@@ -67,17 +67,41 @@
       loop: "{{ deployments_to_rollback }}"
       register: deployment_rs_infos
 
-    - name: Find previous good RS image for each deployment
+    - name: Get current active image for each deployment
+      set_fact:
+        current_images: >-
+          {{ current_images | default({}) | combine({
+               item.item: (item.resources
+                          | selectattr('status.replicas', 'defined')
+                          | selectattr('status.replicas', '>', 0)
+                          | sort(attribute='metadata.creationTimestamp')
+                          | last).spec.template.spec.containers | first | json_query('image')
+             }) }}
+      loop: "{{ deployment_rs_infos.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Log current broken images
+      debug:
+        msg: "Current broken image for {{ item.key }}: {{ item.value }}"
+      loop: "{{ current_images | dict2items }}"
+
+    - name: Find previous good RS image (different from current broken image)
       set_fact:
         rollback_targets: >-
           {{ rollback_targets | default([]) +
              [{'deployment': item.item,
-               'image': item.resources
+               'image': (item.resources
                         | sort(attribute='metadata.creationTimestamp')
-                        | selectattr('spec.replicas', 'equalto', 0)
+                        | reverse
+                        | selectattr('status.replicas', 'defined')
+                        | selectattr('status.replicas', 'equalto', 0)
                         | map(attribute='spec.template.spec.containers')
-                        | list | last | first
-                        | json_query('image')}]
+                        | list
+                        | map('first')
+                        | selectattr('image', '!=', current_images[item.item])
+                        | list
+                        | first).image}]
           }}
       loop: "{{ deployment_rs_infos.results }}"
       loop_control:

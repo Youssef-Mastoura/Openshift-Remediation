@@ -37,3 +37,13 @@
           job_args:
             extra_vars:
               event: "{{ event }}"
+              
+    - name: Trigger Deployment Regression Fix
+      condition: event.payload.alerts is selectattr("labels.remediation", "==", "deployment-regression")
+      action:
+        run_job_template:
+          name: "deployment-regression-remediation"
+          organization: "Default"
+          job_args:
+            extra_vars:
+              event: "{{ event }}"

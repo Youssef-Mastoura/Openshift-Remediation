@@ -75,7 +75,7 @@
                           | selectattr('status.replicas', 'defined')
                           | selectattr('status.replicas', '>', 0)
                           | sort(attribute='metadata.creationTimestamp')
-                          | last).spec.template.spec.containers | first | map(attribute='image') | first
+                          | last).spec.template.spec.containers[0].image
              }) }}
       loop: "{{ deployment_rs_infos.results }}"
       loop_control:
@@ -97,8 +97,6 @@
                         | selectattr('status.replicas', 'defined')
                         | selectattr('status.replicas', 'equalto', 0)
                         | map(attribute='spec.template.spec.containers')
-                        | list
-                        | map('first')
                         | map('first')
                         | selectattr('image', '!=', current_images[item.item])
                         | map(attribute='image')

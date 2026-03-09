@@ -1,0 +1,76 @@
+---
+- name: Deployment Regression Remediation
+  hosts: localhost
+  connection: local
+  gather_facts: true
+
+  vars:
+    app_namespace: ms-demo
+    regression_window_minutes: 5
+
+  tasks:
+
+    - name: Log remediation start
+      debug:
+        msg: "Deployment regression detected in {{ app_namespace }} — finding recently deployed services"
+
+    - name: Get current time
+      set_fact:
+        current_time: "{{ ansible_date_time.iso8601 }}"
+
+    - name: Get all ReplicaSets in namespace
+      kubernetes.core.k8s_info:
+        kind: ReplicaSet
+        namespace: "{{ app_namespace }}"
+        validate_certs: false
+      register: all_replicasets
+
+    - name: Build list of recent deployments to roll back
+      set_fact:
+        deployments_to_rollback: >-
+          {{ deployments_to_rollback | default([]) +
+             [item.metadata.ownerReferences
+              | selectattr('kind', '==', 'Deployment')
+              | map(attribute='name')
+              | first]
+          }}
+      loop: "{{ all_replicasets.resources | selectattr('metadata.ownerReferences', 'defined') | list }}"
+      when: >-
+        (current_time | to_datetime('%Y-%m-%dT%H:%M:%SZ') -
+         item.metadata.creationTimestamp | to_datetime('%Y-%m-%dT%H:%M:%SZ')).total_seconds()
+        <= (regression_window_minutes | int * 60)
+
+    - name: Remove duplicate deployment names
+      set_fact:
+        deployments_to_rollback: "{{ deployments_to_rollback | default([]) | unique }}"
+
+    - name: Fail gracefully if no recent deployments found
+      fail:
+        msg: "No deployments updated in the last {{ regression_window_minutes }} minutes. Cannot identify regression source."
+      when: deployments_to_rollback | length == 0
+
+    - name: Log deployments to roll back
+      debug:
+        msg: "Deployments to roll back: {{ deployments_to_rollback }}"
+
+    - name: Roll back each regressed deployment
+      command: >
+        oc rollout undo deployment/{{ item }} -n {{ app_namespace }}
+      loop: "{{ deployments_to_rollback }}"
+      register: rollback_results
+
+    - name: Log rollback results
+      debug:
+        msg: "Rolled back {{ item.item }}: {{ item.stdout }}"
+      loop: "{{ rollback_results.results }}"
+
+    - name: Wait for each deployment rollback to complete
+      command: >
+        oc rollout status deployment/{{ item }} -n {{ app_namespace }} --timeout=120s
+      loop: "{{ deployments_to_rollback }}"
+      register: rollout_statuses
+
+    - name: Log final status
+      debug:
+        msg: "Rollback complete for {{ item.item }}: {{ item.stdout }}"
+      loop: "{{ rollout_statuses.results }}"

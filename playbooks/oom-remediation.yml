@@ -22,39 +22,13 @@
       debug:
         msg: "OOMKilled on pod={{ oom_pod }} container={{ oom_container }} type={{ remediation_type }}"
 
-    - name: Get pod info
-      kubernetes.core.k8s_info:
-        kind: Pod
-        name: "{{ oom_pod }}"
-        namespace: "{{ app_namespace }}"
-        validate_certs: false
-      register: pod_info
-      ignore_errors: true
-
-    - name: Extract ReplicaSet name from pod ownerReferences
+    - name: Derive deployment name from pod name
       set_fact:
-        rs_name: >-
-          {{ (pod_info.resources | default([{}]))[0].metadata.ownerReferences
-             | selectattr('kind', '==', 'ReplicaSet')
-             | map(attribute='name') | first
-             | default(oom_pod | regex_replace('-[a-z0-9]+$', '')) }}
+        deployment_name: "{{ oom_pod | regex_replace('-[a-z0-9]+-[a-z0-9]+$', '') }}"
 
-    - name: Get ReplicaSet info
-      kubernetes.core.k8s_info:
-        kind: ReplicaSet
-        name: "{{ rs_name }}"
-        namespace: "{{ app_namespace }}"
-        validate_certs: false
-      register: rs_info
-      ignore_errors: true
-
-    - name: Extract Deployment name from ReplicaSet ownerReferences
-      set_fact:
-        deployment_name: >-
-          {{ (rs_info.resources | default([{}]))[0].metadata.ownerReferences
-             | selectattr('kind', '==', 'Deployment')
-             | map(attribute='name') | first
-             | default(oom_pod | regex_replace('-[a-z0-9]+-[a-z0-9]+$', '')) }}
+    - name: Log derived deployment name
+      debug:
+        msg: "Derived deployment name: {{ deployment_name }}"
 
     - name: Get Deployment info
       kubernetes.core.k8s_info:

@@ -3,10 +3,11 @@
   hosts: localhost
   connection: local
   gather_facts: true
-  vars:
-    app_namespace: ms-demo
-  tasks:
 
+  vars:
+    app_namespace: "ms-demo"
+
+  tasks:
     - name: Log remediation start
       debug:
         msg: "OOMKilled alert received — starting memory remediation"
@@ -21,8 +22,6 @@
       debug:
         msg: "OOMKilled on pod={{ oom_pod }} container={{ oom_container }} type={{ remediation_type }}"
 
-    # ── STEP 1: Pod → ReplicaSet → Deployment chain ──────────────────────────
-
     - name: Get pod info
       kubernetes.core.k8s_info:
         kind: Pod
@@ -30,28 +29,32 @@
         namespace: "{{ app_namespace }}"
         validate_certs: false
       register: pod_info
+      ignore_errors: true
 
     - name: Extract ReplicaSet name from pod ownerReferences
       set_fact:
-        replicaset_name: >-
-          {{ pod_info.resources[0].metadata.ownerReferences
+        rs_name: >-
+          {{ (pod_info.resources | default([{}]))[0].metadata.ownerReferences
              | selectattr('kind', '==', 'ReplicaSet')
-             | map(attribute='name') | first }}
+             | map(attribute='name') | first
+             | default(oom_pod | regex_replace('-[a-z0-9]+$', '')) }}
 
     - name: Get ReplicaSet info
       kubernetes.core.k8s_info:
         kind: ReplicaSet
-        name: "{{ replicaset_name }}"
+        name: "{{ rs_name }}"
         namespace: "{{ app_namespace }}"
         validate_certs: false
       register: rs_info
+      ignore_errors: true
 
     - name: Extract Deployment name from ReplicaSet ownerReferences
       set_fact:
         deployment_name: >-
-          {{ rs_info.resources[0].metadata.ownerReferences
+          {{ (rs_info.resources | default([{}]))[0].metadata.ownerReferences
              | selectattr('kind', '==', 'Deployment')
-             | map(attribute='name') | first }}
+             | map(attribute='name') | first
+             | default(oom_pod | regex_replace('-[a-z0-9]+-[a-z0-9]+$', '')) }}
 
     - name: Get Deployment info
       kubernetes.core.k8s_info:
@@ -61,20 +64,16 @@
         validate_certs: false
       register: deployment_info
 
-    # ── STEP 2: Read current memory limit and calculate new value ─────────────
-
     - name: Extract current memory limit from Deployment spec
       set_fact:
         current_mem_raw: >-
           {{ deployment_info.resources[0].spec.template.spec.containers
              | selectattr('name', '==', oom_container)
-             | map(attribute='resources.limits.memory')
-             | first }}
+             | map(attribute='resources.limits.memory') | first }}
 
     - name: Convert memory limit to Mi integer
       set_fact:
-        current_mem_mi: >-
-          {{ current_mem_raw | regex_replace('Mi', '') | int }}
+        current_mem_mi: "{{ current_mem_raw | regex_replace('Mi', '') | int }}"
 
     - name: Calculate new memory limit (current x 1.5)
       set_fact:
@@ -87,24 +86,20 @@
     - name: Log deployment and memory values
       debug:
         msg: >-
-          Deployment={{ deployment_name }}
-          container={{ oom_container }}
-          current_memory={{ current_mem_raw }}
-          new_memory={{ new_mem_limit }}
-          current_replicas={{ current_replicas }}
-          remediation_type={{ remediation_type }}
-
-    # ── STEP 3: Vertical scale — always applied ───────────────────────────────
+          Deployment={{ deployment_name }} container={{ oom_container }}
+          current_memory={{ current_mem_raw }} new_memory={{ new_mem_limit }}
+          current_replicas={{ current_replicas }} remediation_type={{ remediation_type }}
 
     - name: Patch deployment — increase memory limit by 1.5x
       kubernetes.core.k8s:
+        state: present
         validate_certs: false
-        state: patched
-        kind: Deployment
-        name: "{{ deployment_name }}"
-        namespace: "{{ app_namespace }}"
         definition:
+          apiVersion: apps/v1
+          kind: Deployment
           metadata:
+            name: "{{ deployment_name }}"
+            namespace: "{{ app_namespace }}"
             annotations:
               remediation/oom-memory-increased-at: "{{ ansible_date_time.iso8601 }}"
               remediation/oom-previous-limit: "{{ current_mem_raw }}"
@@ -117,27 +112,26 @@
                     resources:
                       limits:
                         memory: "{{ new_mem_limit }}"
-
-    # ── STEP 4: Horizontal scale — only if recurring OOMKill ─────────────────
+                      requests:
+                        memory: "{{ (current_mem_mi | int * 0.75) | int }}Mi"
 
     - name: Scale up replicas by 1 (recurring OOM only)
+      when: remediation_type == "increase-mem-recurring"
       kubernetes.core.k8s:
+        state: present
         validate_certs: false
-        state: patched
-        kind: Deployment
-        name: "{{ deployment_name }}"
-        namespace: "{{ app_namespace }}"
         definition:
+          apiVersion: apps/v1
+          kind: Deployment
           metadata:
+            name: "{{ deployment_name }}"
+            namespace: "{{ app_namespace }}"
             annotations:
               remediation/oom-replicas-scaled-at: "{{ ansible_date_time.iso8601 }}"
-              remediation/oom-previous-replicas: "{{ current_replicas }}"
-              remediation/oom-new-replicas: "{{ current_replicas | int + 1 }}"
+              remediation/oom-previous-replicas: "{{ current_replicas | string }}"
+              remediation/oom-new-replicas: "{{ ((current_replicas | int) + 1) | string }}"
           spec:
-            replicas: "{{ current_replicas | int + 1 }}"
-      when: remediation_type == "increase-mem-recurring"
-
-    # ── STEP 5: Wait for rollout ──────────────────────────────────────────────
+            replicas: "{{ (current_replicas | int) + 1 }}"
 
     - name: Wait for rollout to complete
       kubernetes.core.k8s_info:
@@ -145,43 +139,20 @@
         name: "{{ deployment_name }}"
         namespace: "{{ app_namespace }}"
         validate_certs: false
-      register: rollout_check
+      register: rollout_status
       until: >-
-        rollout_check.resources[0].status.readyReplicas is defined and
-        rollout_check.resources[0].status.readyReplicas ==
-        rollout_check.resources[0].spec.replicas
+        rollout_status.resources[0].status.readyReplicas is defined and
+        rollout_status.resources[0].status.readyReplicas ==
+        rollout_status.resources[0].spec.replicas
       retries: 12
       delay: 10
 
-    # ── STEP 6: Structured remediation summary ────────────────────────────────
-
-    - name: Remediation summary — vertical scale only
+    - name: Remediation summary
       debug:
-        msg:
-          - "====== REMEDIATION SUMMARY ======"
-          - "Deployment    : {{ deployment_name }}"
-          - "Container     : {{ oom_container }}"
-          - "Pod           : {{ oom_pod }}"
-          - "Strategy      : Vertical scale only (first OOM)"
-          - "Memory before : {{ current_mem_raw }}"
-          - "Memory after  : {{ new_mem_limit }}"
-          - "Replicas      : unchanged ({{ current_replicas }})"
-          - "Status        : readyReplicas={{ rollout_check.resources[0].status.readyReplicas }}"
-          - "================================="
-      when: remediation_type == "increase-mem"
-
-    - name: Remediation summary — vertical + horizontal scale
-      debug:
-        msg:
-          - "====== REMEDIATION SUMMARY ======"
-          - "Deployment    : {{ deployment_name }}"
-          - "Container     : {{ oom_container }}"
-          - "Pod           : {{ oom_pod }}"
-          - "Strategy      : Vertical + Horizontal scale (recurring OOM)"
-          - "Memory before : {{ current_mem_raw }}"
-          - "Memory after  : {{ new_mem_limit }}"
-          - "Replicas before: {{ current_replicas }}"
-          - "Replicas after : {{ current_replicas | int + 1 }}"
-          - "Status        : readyReplicas={{ rollout_check.resources[0].status.readyReplicas }}"
-          - "================================="
-      when: remediation_type == "increase-mem-recurring"
+        msg: >-
+          ✅ Remediation complete for {{ deployment_name }}.
+          Strategy={{ remediation_type }}.
+          Memory {{ current_mem_raw }} → {{ new_mem_limit }}.
+          {% if remediation_type == 'increase-mem-recurring' %}
+          Replicas {{ current_replicas }} → {{ (current_replicas | int) + 1 }}.
+          {% endif %}

@@ -12,7 +12,7 @@
       condition: event.payload.alerts is selectattr("labels.remediation", "==", "increase-mem")
       action:
         run_job_template:
-          name: "Fix OOM Template"
+          name: "oom-remediation"
           organization: "Default"
           job_args:
             extra_vars:
@@ -22,7 +22,7 @@
       condition: event.payload.alerts is selectattr("labels.remediation", "==", "increase-mem-recurring")
       action:
         run_job_template:
-          name: "Fix OOM Template"
+          name: "oom-remediation"
           organization: "Default"
           job_args:
             extra_vars:

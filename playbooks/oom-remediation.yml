@@ -1,0 +1,187 @@
+---
+- name: OOMKilled Memory Remediation
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars:
+    app_namespace: ms-demo
+  tasks:
+
+    - name: Log remediation start
+      debug:
+        msg: "OOMKilled alert received — starting memory remediation"
+
+    - name: Extract pod, container and remediation type from event
+      set_fact:
+        oom_pod: "{{ event.payload.alerts[0].labels.pod }}"
+        oom_container: "{{ event.payload.alerts[0].labels.container }}"
+        remediation_type: "{{ event.payload.alerts[0].labels.remediation }}"
+
+    - name: Log extracted values
+      debug:
+        msg: "OOMKilled on pod={{ oom_pod }} container={{ oom_container }} type={{ remediation_type }}"
+
+    # ── STEP 1: Pod → ReplicaSet → Deployment chain ──────────────────────────
+
+    - name: Get pod info
+      kubernetes.core.k8s_info:
+        kind: Pod
+        name: "{{ oom_pod }}"
+        namespace: "{{ app_namespace }}"
+        validate_certs: false
+      register: pod_info
+
+    - name: Extract ReplicaSet name from pod ownerReferences
+      set_fact:
+        replicaset_name: >-
+          {{ pod_info.resources[0].metadata.ownerReferences
+             | selectattr('kind', '==', 'ReplicaSet')
+             | map(attribute='name') | first }}
+
+    - name: Get ReplicaSet info
+      kubernetes.core.k8s_info:
+        kind: ReplicaSet
+        name: "{{ replicaset_name }}"
+        namespace: "{{ app_namespace }}"
+        validate_certs: false
+      register: rs_info
+
+    - name: Extract Deployment name from ReplicaSet ownerReferences
+      set_fact:
+        deployment_name: >-
+          {{ rs_info.resources[0].metadata.ownerReferences
+             | selectattr('kind', '==', 'Deployment')
+             | map(attribute='name') | first }}
+
+    - name: Get Deployment info
+      kubernetes.core.k8s_info:
+        kind: Deployment
+        name: "{{ deployment_name }}"
+        namespace: "{{ app_namespace }}"
+        validate_certs: false
+      register: deployment_info
+
+    # ── STEP 2: Read current memory limit and calculate new value ─────────────
+
+    - name: Extract current memory limit from Deployment spec
+      set_fact:
+        current_mem_raw: >-
+          {{ deployment_info.resources[0].spec.template.spec.containers
+             | selectattr('name', '==', oom_container)
+             | map(attribute='resources.limits.memory')
+             | first }}
+
+    - name: Convert memory limit to Mi integer
+      set_fact:
+        current_mem_mi: >-
+          {{ current_mem_raw | regex_replace('Mi', '') | int }}
+
+    - name: Calculate new memory limit (current x 1.5)
+      set_fact:
+        new_mem_limit: "{{ (current_mem_mi | int * 1.5) | int }}Mi"
+
+    - name: Get current replica count
+      set_fact:
+        current_replicas: "{{ deployment_info.resources[0].spec.replicas | int }}"
+
+    - name: Log deployment and memory values
+      debug:
+        msg: >-
+          Deployment={{ deployment_name }}
+          container={{ oom_container }}
+          current_memory={{ current_mem_raw }}
+          new_memory={{ new_mem_limit }}
+          current_replicas={{ current_replicas }}
+          remediation_type={{ remediation_type }}
+
+    # ── STEP 3: Vertical scale — always applied ───────────────────────────────
+
+    - name: Patch deployment — increase memory limit by 1.5x
+      kubernetes.core.k8s:
+        validate_certs: false
+        state: patched
+        kind: Deployment
+        name: "{{ deployment_name }}"
+        namespace: "{{ app_namespace }}"
+        definition:
+          metadata:
+            annotations:
+              remediation/oom-memory-increased-at: "{{ ansible_date_time.iso8601 }}"
+              remediation/oom-previous-limit: "{{ current_mem_raw }}"
+              remediation/oom-new-limit: "{{ new_mem_limit }}"
+          spec:
+            template:
+              spec:
+                containers:
+                  - name: "{{ oom_container }}"
+                    resources:
+                      limits:
+                        memory: "{{ new_mem_limit }}"
+
+    # ── STEP 4: Horizontal scale — only if recurring OOMKill ─────────────────
+
+    - name: Scale up replicas by 1 (recurring OOM only)
+      kubernetes.core.k8s:
+        validate_certs: false
+        state: patched
+        kind: Deployment
+        name: "{{ deployment_name }}"
+        namespace: "{{ app_namespace }}"
+        definition:
+          metadata:
+            annotations:
+              remediation/oom-replicas-scaled-at: "{{ ansible_date_time.iso8601 }}"
+              remediation/oom-previous-replicas: "{{ current_replicas }}"
+              remediation/oom-new-replicas: "{{ current_replicas | int + 1 }}"
+          spec:
+            replicas: "{{ current_replicas | int + 1 }}"
+      when: remediation_type == "increase-mem-recurring"
+
+    # ── STEP 5: Wait for rollout ──────────────────────────────────────────────
+
+    - name: Wait for rollout to complete
+      kubernetes.core.k8s_info:
+        kind: Deployment
+        name: "{{ deployment_name }}"
+        namespace: "{{ app_namespace }}"
+        validate_certs: false
+      register: rollout_check
+      until: >-
+        rollout_check.resources[0].status.readyReplicas is defined and
+        rollout_check.resources[0].status.readyReplicas ==
+        rollout_check.resources[0].spec.replicas
+      retries: 12
+      delay: 10
+
+    # ── STEP 6: Structured remediation summary ────────────────────────────────
+
+    - name: Remediation summary — vertical scale only
+      debug:
+        msg:
+          - "====== REMEDIATION SUMMARY ======"
+          - "Deployment    : {{ deployment_name }}"
+          - "Container     : {{ oom_container }}"
+          - "Pod           : {{ oom_pod }}"
+          - "Strategy      : Vertical scale only (first OOM)"
+          - "Memory before : {{ current_mem_raw }}"
+          - "Memory after  : {{ new_mem_limit }}"
+          - "Replicas      : unchanged ({{ current_replicas }})"
+          - "Status        : readyReplicas={{ rollout_check.resources[0].status.readyReplicas }}"
+          - "================================="
+      when: remediation_type == "increase-mem"
+
+    - name: Remediation summary — vertical + horizontal scale
+      debug:
+        msg:
+          - "====== REMEDIATION SUMMARY ======"
+          - "Deployment    : {{ deployment_name }}"
+          - "Container     : {{ oom_container }}"
+          - "Pod           : {{ oom_pod }}"
+          - "Strategy      : Vertical + Horizontal scale (recurring OOM)"
+          - "Memory before : {{ current_mem_raw }}"
+          - "Memory after  : {{ new_mem_limit }}"
+          - "Replicas before: {{ current_replicas }}"
+          - "Replicas after : {{ current_replicas | int + 1 }}"
+          - "Status        : readyReplicas={{ rollout_check.resources[0].status.readyReplicas }}"
+          - "================================="
+      when: remediation_type == "increase-mem-recurring"

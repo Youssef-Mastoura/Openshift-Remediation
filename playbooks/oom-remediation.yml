@@ -91,6 +91,16 @@
 
     - name: Scale up replicas by 1 (recurring OOM only)
       when: remediation_type == "increase-mem-recurring"
+      kubernetes.core.k8s_scale:
+        api_version: apps/v1
+        kind: Deployment
+        name: "{{ deployment_name }}"
+        namespace: "{{ app_namespace }}"
+        replicas: "{{ (current_replicas | int) + 1 }}"
+        validate_certs: false
+
+    - name: Annotate replica scale (recurring OOM only)
+      when: remediation_type == "increase-mem-recurring"
       kubernetes.core.k8s:
         state: present
         validate_certs: false
@@ -104,8 +114,6 @@
               remediation/oom-replicas-scaled-at: "{{ ansible_date_time.iso8601 }}"
               remediation/oom-previous-replicas: "{{ current_replicas | string }}"
               remediation/oom-new-replicas: "{{ ((current_replicas | int) + 1) | string }}"
-          spec:
-            replicas: "{{ (current_replicas | int) + 1 }}"
 
     - name: Wait for rollout to complete
       kubernetes.core.k8s_info:

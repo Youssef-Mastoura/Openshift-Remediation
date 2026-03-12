@@ -18,6 +18,16 @@
             extra_vars:
               event: "{{ event }}"
 
+    - name: Trigger Recurring OOMKilled Fix
+      condition: event.payload.alerts is selectattr("labels.remediation", "==", "increase-mem-recurring")
+      action:
+        run_job_template:
+          name: "Fix OOM Template"
+          organization: "Default"
+          job_args:
+            extra_vars:
+              event: "{{ event }}"
+
     - name: Trigger ConfigMap Desync Fix
       condition: event.payload.alerts is selectattr("labels.remediation", "==", "configmap-desync")
       action:

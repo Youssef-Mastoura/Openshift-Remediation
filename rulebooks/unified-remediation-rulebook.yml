@@ -68,18 +68,8 @@
             extra_vars:
               event: "{{ event }}"
               
-    - name: Trigger Pending Pod Insufficient Resources Fix
-      condition: event.payload.alerts is selectattr("labels.remediation", "==", "pending-pod-resources")
-      action:
-        run_job_template:
-          name: "pending-pod-remediation"
-          organization: "Default"
-          job_args:
-            extra_vars:
-              event: "{{ event }}"
-
-    - name: Trigger Pending Pod Node Affinity Fix
-      condition: event.payload.alerts is selectattr("labels.remediation", "==", "pending-pod-affinity")
+    - name: Trigger Pending Pod Unschedulable Fix
+      condition: event.payload.alerts is selectattr("labels.remediation", "==", "pending-pod-unschedulable")
       action:
         run_job_template:
           name: "pending-pod-remediation"

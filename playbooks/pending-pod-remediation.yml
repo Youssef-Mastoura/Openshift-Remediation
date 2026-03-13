@@ -17,35 +17,13 @@
       debug:
         msg: "Pending pod alert fired — pod={{ alert_pod }} cause={{ remediation_type }}"
 
-    - name: Get pod info
-      kubernetes.core.k8s_info:
-        kind: Pod
-        name: "{{ alert_pod }}"
-        namespace: "{{ app_namespace }}"
-        validate_certs: false
-      register: pod_info
-
-    - name: Extract ReplicaSet name from pod
+    - name: Derive deployment name from pod name
       set_fact:
-        replicaset_name: >-
-          {{ pod_info.resources[0].metadata.ownerReferences
-             | selectattr('kind', '==', 'ReplicaSet')
-             | map(attribute='name') | first }}
+        deployment_name: "{{ alert_pod | regex_replace('-[a-z0-9]+-[a-z0-9]+$', '') }}"
 
-    - name: Get ReplicaSet info
-      kubernetes.core.k8s_info:
-        kind: ReplicaSet
-        name: "{{ replicaset_name }}"
-        namespace: "{{ app_namespace }}"
-        validate_certs: false
-      register: rs_info
-
-    - name: Extract Deployment name from ReplicaSet
-      set_fact:
-        deployment_name: >-
-          {{ rs_info.resources[0].metadata.ownerReferences
-             | selectattr('kind', '==', 'Deployment')
-             | map(attribute='name') | first }}
+    - name: Log derived deployment name
+      debug:
+        msg: "Derived deployment name: {{ deployment_name }}"
 
     - name: Get Deployment info
       kubernetes.core.k8s_info:
@@ -54,10 +32,6 @@
         namespace: "{{ app_namespace }}"
         validate_certs: false
       register: deployment_info
-
-    - name: Log deployment name
-      debug:
-        msg: "Deployment={{ deployment_name }} cause={{ remediation_type }}"
 
     # ─────────────────────────────────────────────
     # CAUSE 1 — Insufficient Resources
@@ -104,15 +78,18 @@
 
     - name: "[Resources] Patch deployment with reduced resource requests"
       kubernetes.core.k8s:
+        state: present
         validate_certs: false
-        state: patched
-        kind: Deployment
-        name: "{{ deployment_name }}"
-        namespace: "{{ app_namespace }}"
         definition:
+          apiVersion: apps/v1
+          kind: Deployment
           metadata:
+            name: "{{ deployment_name }}"
+            namespace: "{{ app_namespace }}"
             annotations:
               remediation/resources-reduced-at: "{{ ansible_date_time.iso8601 }}"
+              remediation/previous-cpu-request: "{{ current_cpu_request }}"
+              remediation/new-cpu-request: "{{ new_cpu_request }}"
           spec:
             template:
               spec:
@@ -135,13 +112,14 @@
 
     - name: "[Affinity] Remove nodeSelector from deployment"
       kubernetes.core.k8s:
+        state: present
         validate_certs: false
-        state: patched
-        kind: Deployment
-        name: "{{ deployment_name }}"
-        namespace: "{{ app_namespace }}"
         definition:
+          apiVersion: apps/v1
+          kind: Deployment
           metadata:
+            name: "{{ deployment_name }}"
+            namespace: "{{ app_namespace }}"
             annotations:
               remediation/affinity-removed-at: "{{ ansible_date_time.iso8601 }}"
           spec:
@@ -176,8 +154,8 @@
 
     - name: "[PVC] Delete pending PVCs to force reprovisioning"
       kubernetes.core.k8s:
-        validate_certs: false
         state: absent
+        validate_certs: false
         kind: PersistentVolumeClaim
         name: "{{ item.metadata.name }}"
         namespace: "{{ app_namespace }}"
@@ -187,8 +165,23 @@
         - pending_pvcs | length > 0
 
     # ─────────────────────────────────────────────
-    # FINAL — Report
+    # FINAL — Wait and Report
     # ─────────────────────────────────────────────
+
+    - name: Wait for deployment rollout to complete
+      kubernetes.core.k8s_info:
+        kind: Deployment
+        name: "{{ deployment_name }}"
+        namespace: "{{ app_namespace }}"
+        validate_certs: false
+      register: rollout_status
+      until: >-
+        rollout_status.resources[0].status.readyReplicas is defined and
+        rollout_status.resources[0].status.readyReplicas ==
+        rollout_status.resources[0].spec.replicas
+      retries: 12
+      delay: 10
+      when: remediation_type != "pending-pod-pvc"
 
     - name: Report remediation complete
       debug:

@@ -196,13 +196,50 @@
         msg: "Found {{ pending_pvcs | length }} pending PVC(s): {{ pending_pvcs | map(attribute='metadata.name') | list }}"
       when: remediation_type == "pending-pod-pvc"
 
-    - name: "[PVC] Delete pending PVCs to force reprovisioning"
+    - name: "[PVC] Create matching hostPath PV for each pending PVC"
       kubernetes.core.k8s:
-        state: absent
+        state: present
         validate_certs: false
+        definition:
+          apiVersion: v1
+          kind: PersistentVolume
+          metadata:
+            name: "remediation-pv-{{ item.metadata.name }}"
+            annotations:
+              remediation/created-at: "{{ ansible_date_time.iso8601 }}"
+              remediation/for-pvc: "{{ item.metadata.name }}"
+          spec:
+            capacity:
+              storage: "{{ item.spec.resources.requests.storage }}"
+            accessModes: "{{ item.spec.accessModes }}"
+            persistentVolumeReclaimPolicy: Delete
+            storageClassName: "{{ item.spec.storageClassName }}"
+            hostPath:
+              path: "/tmp/remediation-{{ item.metadata.name }}"
+              type: DirectoryOrCreate
+      loop: "{{ pending_pvcs }}"
+      when:
+        - remediation_type == "pending-pod-pvc"
+        - pending_pvcs | length > 0
+
+    - name: "[PVC] Wait for PVC to bind"
+      kubernetes.core.k8s_info:
         kind: PersistentVolumeClaim
         name: "{{ item.metadata.name }}"
         namespace: "{{ app_namespace }}"
+        validate_certs: false
+      register: pvc_status
+      until: pvc_status.resources[0].status.phase == "Bound"
+      retries: 12
+      delay: 10
+      loop: "{{ pending_pvcs }}"
+      when:
+        - remediation_type == "pending-pod-pvc"
+        - pending_pvcs | length > 0
+
+    - name: "[PVC] Log PVC bound successfully"
+      debug:
+        msg: "PVC {{ item.metadata.name }} is now Bound to PV remediation-pv-{{ item.metadata.name }}"
       loop: "{{ pending_pvcs }}"
       when:
         - remediation_type == "pending-pod-pvc"
@@ -225,7 +262,6 @@
         rollout_status.resources[0].spec.replicas
       retries: 12
       delay: 10
-      when: remediation_type != "pending-pod-pvc"
 
     - name: Report remediation complete
       debug:

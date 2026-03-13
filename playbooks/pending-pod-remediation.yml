@@ -1,39 +1,73 @@
 ---
 - name: S7 - Pending Pod Remediation (3 causes)
   hosts: localhost
-  gather_facts: false
+  connection: local
+  gather_facts: true
   vars:
-    kubeconfig_path: /var/lib/awx/.kube/config
+    app_namespace: ms-demo
 
   tasks:
 
     - name: Extract alert info from event
       set_fact:
-        alert_namespace: "{{ event.payload.alerts[0].labels.namespace }}"
         alert_pod: "{{ event.payload.alerts[0].labels.pod }}"
         remediation_type: "{{ event.payload.alerts[0].labels.remediation }}"
 
-    - name: Derive deployment name from pod name
-      set_fact:
-        deployment_name: "{{ alert_pod | regex_replace('-[a-z0-9]+-[a-z0-9]+$', '') }}"
+    - name: Log remediation start
+      debug:
+        msg: "Pending pod alert fired — pod={{ alert_pod }} cause={{ remediation_type }}"
 
-    - name: Get deployment info
+    - name: Get pod info
       kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig_path }}"
-        api_version: apps/v1
+        kind: Pod
+        name: "{{ alert_pod }}"
+        namespace: "{{ app_namespace }}"
+        validate_certs: false
+      register: pod_info
+
+    - name: Extract ReplicaSet name from pod
+      set_fact:
+        replicaset_name: >-
+          {{ pod_info.resources[0].metadata.ownerReferences
+             | selectattr('kind', '==', 'ReplicaSet')
+             | map(attribute='name') | first }}
+
+    - name: Get ReplicaSet info
+      kubernetes.core.k8s_info:
+        kind: ReplicaSet
+        name: "{{ replicaset_name }}"
+        namespace: "{{ app_namespace }}"
+        validate_certs: false
+      register: rs_info
+
+    - name: Extract Deployment name from ReplicaSet
+      set_fact:
+        deployment_name: >-
+          {{ rs_info.resources[0].metadata.ownerReferences
+             | selectattr('kind', '==', 'Deployment')
+             | map(attribute='name') | first }}
+
+    - name: Get Deployment info
+      kubernetes.core.k8s_info:
         kind: Deployment
         name: "{{ deployment_name }}"
-        namespace: "{{ alert_namespace }}"
+        namespace: "{{ app_namespace }}"
+        validate_certs: false
       register: deployment_info
 
-    - name: Fail if deployment not found
-      fail:
-        msg: "Deployment {{ deployment_name }} not found in namespace {{ alert_namespace }}"
-      when: deployment_info.resources | length == 0
+    - name: Log deployment name
+      debug:
+        msg: "Deployment={{ deployment_name }} cause={{ remediation_type }}"
 
     # ─────────────────────────────────────────────
     # CAUSE 1 — Insufficient Resources
     # ─────────────────────────────────────────────
+
+    - name: "[Resources] Extract container name"
+      set_fact:
+        container_name: >-
+          {{ deployment_info.resources[0].spec.template.spec.containers[0].name }}
+      when: remediation_type == "pending-pod-resources"
 
     - name: "[Resources] Extract current CPU and memory requests"
       set_fact:
@@ -43,20 +77,16 @@
         current_mem_request: >-
           {{ deployment_info.resources[0].spec.template.spec.containers[0]
              .resources.requests.memory | default('128Mi') }}
-        container_name: >-
-          {{ deployment_info.resources[0].spec.template.spec.containers[0].name }}
       when: remediation_type == "pending-pod-resources"
 
     - name: "[Resources] Convert CPU request to millicores integer"
       set_fact:
-        cpu_millicores: >-
-          {{ current_cpu_request | regex_replace('m', '') | int }}
+        cpu_millicores: "{{ current_cpu_request | regex_replace('m', '') | int }}"
       when: remediation_type == "pending-pod-resources"
 
     - name: "[Resources] Convert memory request to Mi integer"
       set_fact:
-        mem_mi: >-
-          {{ current_mem_request | regex_replace('Mi', '') | int }}
+        mem_mi: "{{ current_mem_request | regex_replace('Mi', '') | int }}"
       when: remediation_type == "pending-pod-resources"
 
     - name: "[Resources] Compute reduced requests (×0.75)"
@@ -68,21 +98,21 @@
     - name: "[Resources] Log current and new resource requests"
       debug:
         msg: >
-          Deployment: {{ deployment_name }}
-          | CPU: {{ current_cpu_request }} → {{ new_cpu_request }}
+          CPU: {{ current_cpu_request }} → {{ new_cpu_request }}
           | Memory: {{ current_mem_request }} → {{ new_mem_request }}
       when: remediation_type == "pending-pod-resources"
 
     - name: "[Resources] Patch deployment with reduced resource requests"
       kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig_path }}"
-        state: present
+        validate_certs: false
+        state: patched
+        kind: Deployment
+        name: "{{ deployment_name }}"
+        namespace: "{{ app_namespace }}"
         definition:
-          apiVersion: apps/v1
-          kind: Deployment
           metadata:
-            name: "{{ deployment_name }}"
-            namespace: "{{ alert_namespace }}"
+            annotations:
+              remediation/resources-reduced-at: "{{ ansible_date_time.iso8601 }}"
           spec:
             template:
               spec:
@@ -92,7 +122,6 @@
                       requests:
                         cpu: "{{ new_cpu_request }}"
                         memory: "{{ new_mem_request }}"
-        merge_type: strategic-merge
       when: remediation_type == "pending-pod-resources"
 
     # ─────────────────────────────────────────────
@@ -106,32 +135,31 @@
 
     - name: "[Affinity] Remove nodeSelector from deployment"
       kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig_path }}"
-        state: present
+        validate_certs: false
+        state: patched
+        kind: Deployment
+        name: "{{ deployment_name }}"
+        namespace: "{{ app_namespace }}"
         definition:
-          apiVersion: apps/v1
-          kind: Deployment
           metadata:
-            name: "{{ deployment_name }}"
-            namespace: "{{ alert_namespace }}"
+            annotations:
+              remediation/affinity-removed-at: "{{ ansible_date_time.iso8601 }}"
           spec:
             template:
               spec:
                 nodeSelector: null
                 affinity: null
-        merge_type: merge
       when: remediation_type == "pending-pod-affinity"
 
     # ─────────────────────────────────────────────
     # CAUSE 3 — PVC Not Bound
     # ─────────────────────────────────────────────
 
-    - name: "[PVC] Find pending PVCs in namespace"
+    - name: "[PVC] Find all PVCs in namespace"
       kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig_path }}"
-        api_version: v1
         kind: PersistentVolumeClaim
-        namespace: "{{ alert_namespace }}"
+        namespace: "{{ app_namespace }}"
+        validate_certs: false
       register: all_pvcs
       when: remediation_type == "pending-pod-pvc"
 
@@ -148,57 +176,23 @@
 
     - name: "[PVC] Delete pending PVCs to force reprovisioning"
       kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig_path }}"
+        validate_certs: false
         state: absent
-        api_version: v1
         kind: PersistentVolumeClaim
         name: "{{ item.metadata.name }}"
-        namespace: "{{ alert_namespace }}"
+        namespace: "{{ app_namespace }}"
       loop: "{{ pending_pvcs }}"
       when:
         - remediation_type == "pending-pod-pvc"
         - pending_pvcs | length > 0
 
-    - name: "[PVC] Wait for pod to exit Pending after PVC deletion"
-      kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig_path }}"
-        api_version: v1
-        kind: Pod
-        namespace: "{{ alert_namespace }}"
-        label_selectors:
-          - "app={{ deployment_name }}"
-      register: pod_status
-      until: >-
-        pod_status.resources | length > 0 and
-        pod_status.resources[0].status.phase != 'Pending'
-      retries: 12
-      delay: 10
-      when:
-        - remediation_type == "pending-pod-pvc"
-        - pending_pvcs | length > 0
-
     # ─────────────────────────────────────────────
-    # FINAL — Verify deployment available
+    # FINAL — Report
     # ─────────────────────────────────────────────
-
-    - name: Wait for deployment to become available
-      kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig_path }}"
-        api_version: apps/v1
-        kind: Deployment
-        name: "{{ deployment_name }}"
-        namespace: "{{ alert_namespace }}"
-        wait: true
-        wait_condition:
-          type: Available
-          status: "True"
-        wait_timeout: 120
-      register: rollout_result
-      when: remediation_type != "pending-pod-pvc"
 
     - name: Report remediation complete
       debug:
         msg: >
           S7 remediation complete for {{ deployment_name }}
           | cause: {{ remediation_type }}
-          | namespace: {{ alert_namespace }}
+          | namespace: {{ app_namespace }}

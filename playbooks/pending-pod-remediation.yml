@@ -34,22 +34,35 @@
       register: deployment_info
 
     # ─────────────────────────────────────────────
-    # CAUSE DETECTION — Affinity or Resources?
+    # CAUSE DETECTION — Read scheduler events
     # ─────────────────────────────────────────────
 
-    - name: "Check if deployment has nodeSelector or affinity"
-      set_fact:
-        has_node_selector: >-
-          {{ deployment_info.resources[0].spec.template.spec.nodeSelector is defined
-             and deployment_info.resources[0].spec.template.spec.nodeSelector | length > 0 }}
-        has_affinity: >-
-          {{ deployment_info.resources[0].spec.template.spec.affinity is defined
-             and deployment_info.resources[0].spec.template.spec.affinity | length > 0 }}
+    - name: Get all events in namespace
+      kubernetes.core.k8s_info:
+        kind: Event
+        namespace: "{{ app_namespace }}"
+        validate_certs: false
+      register: all_events
       when: remediation_type == "pending-pod-unschedulable"
 
-    - name: "Log cause detection result"
+    - name: Filter FailedScheduling events for this pod
+      set_fact:
+        pod_events: >-
+          {{ all_events.resources
+             | selectattr('involvedObject.name', '==', alert_pod)
+             | selectattr('reason', '==', 'FailedScheduling')
+             | map(attribute='message') | list }}
+      when: remediation_type == "pending-pod-unschedulable"
+
+    - name: Detect cause from scheduler message
+      set_fact:
+        has_affinity_issue: >-
+          {{ pod_events | select('search', 'affinity|selector') | list | length > 0 }}
+      when: remediation_type == "pending-pod-unschedulable"
+
+    - name: Log cause detection result
       debug:
-        msg: "nodeSelector={{ has_node_selector }} affinity={{ has_affinity }}"
+        msg: "affinity_issue={{ has_affinity_issue }} | events={{ pod_events }}"
       when: remediation_type == "pending-pod-unschedulable"
 
     # ─────────────────────────────────────────────
@@ -75,14 +88,14 @@
                 affinity: null
       when:
         - remediation_type == "pending-pod-unschedulable"
-        - has_node_selector | bool or has_affinity | bool
+        - has_affinity_issue | bool
 
     - name: "[Affinity] Log fix applied"
       debug:
         msg: "Removed nodeSelector/affinity from {{ deployment_name }}"
       when:
         - remediation_type == "pending-pod-unschedulable"
-        - has_node_selector | bool or has_affinity | bool
+        - has_affinity_issue | bool
 
     # ─────────────────────────────────────────────
     # CAUSE 1 — Insufficient Resources
@@ -100,21 +113,21 @@
              .resources.requests.memory | default('128Mi') }}
       when:
         - remediation_type == "pending-pod-unschedulable"
-        - not (has_node_selector | bool or has_affinity | bool)
+        - not (has_affinity_issue | bool)
 
     - name: "[Resources] Convert CPU request to millicores"
       set_fact:
         cpu_millicores: "{{ current_cpu_request | regex_replace('m', '') | int }}"
       when:
         - remediation_type == "pending-pod-unschedulable"
-        - not (has_node_selector | bool or has_affinity | bool)
+        - not (has_affinity_issue | bool)
 
     - name: "[Resources] Convert memory request to Mi"
       set_fact:
         mem_mi: "{{ current_mem_request | regex_replace('Mi', '') | int }}"
       when:
         - remediation_type == "pending-pod-unschedulable"
-        - not (has_node_selector | bool or has_affinity | bool)
+        - not (has_affinity_issue | bool)
 
     - name: "[Resources] Compute reduced requests (×0.75)"
       set_fact:
@@ -122,7 +135,7 @@
         new_mem_request: "{{ (mem_mi | int * 0.75) | int }}Mi"
       when:
         - remediation_type == "pending-pod-unschedulable"
-        - not (has_node_selector | bool or has_affinity | bool)
+        - not (has_affinity_issue | bool)
 
     - name: "[Resources] Log current and new resource requests"
       debug:
@@ -131,7 +144,7 @@
           | Memory: {{ current_mem_request }} → {{ new_mem_request }}
       when:
         - remediation_type == "pending-pod-unschedulable"
-        - not (has_node_selector | bool or has_affinity | bool)
+        - not (has_affinity_issue | bool)
 
     - name: "[Resources] Patch deployment with reduced resource requests"
       kubernetes.core.k8s:
@@ -158,7 +171,7 @@
                         memory: "{{ new_mem_request }}"
       when:
         - remediation_type == "pending-pod-unschedulable"
-        - not (has_node_selector | bool or has_affinity | bool)
+        - not (has_affinity_issue | bool)
 
     # ─────────────────────────────────────────────
     # CAUSE 3 — PVC Not Bound

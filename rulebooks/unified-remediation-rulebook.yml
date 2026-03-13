@@ -57,3 +57,13 @@
           job_args:
             extra_vars:
               event: "{{ event }}"
+              
+    - name: Trigger Liveness Probe Fix
+      condition: event.payload.alerts is selectattr("labels.remediation", "==", "liveness-probe")
+      action:
+        run_job_template:
+          name: "liveness-probe-remediation"
+          organization: "Default"
+          job_args:
+            extra_vars:
+              event: "{{ event }}"

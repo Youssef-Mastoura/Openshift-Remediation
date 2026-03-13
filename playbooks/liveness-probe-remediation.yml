@@ -1,0 +1,108 @@
+---
+- name: S4 - Liveness Probe Misconfiguration Remediation
+  hosts: localhost
+  gather_facts: false
+  vars:
+    kubeconfig_path: /var/lib/awx/.kube/config
+
+  tasks:
+
+    - name: Extract namespace and pod from event
+      set_fact:
+        alert_namespace: "{{ event.payload.alerts[0].labels.namespace }}"
+        alert_pod: "{{ event.payload.alerts[0].labels.pod }}"
+
+    - name: Derive deployment name from pod name
+      set_fact:
+        deployment_name: "{{ alert_pod | regex_replace('-[a-z0-9]+-[a-z0-9]+$', '') }}"
+
+    - name: Get current deployment spec
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig_path }}"
+        api_version: apps/v1
+        kind: Deployment
+        name: "{{ deployment_name }}"
+        namespace: "{{ alert_namespace }}"
+      register: deployment_info
+
+    - name: Fail if deployment not found
+      fail:
+        msg: "Deployment {{ deployment_name }} not found in namespace {{ alert_namespace }}"
+      when: deployment_info.resources | length == 0
+
+    - name: Extract current liveness probe values
+      set_fact:
+        current_initial_delay: >-
+          {{ deployment_info.resources[0].spec.template.spec.containers[0]
+             .livenessProbe.initialDelaySeconds | default(10) | int }}
+        current_period: >-
+          {{ deployment_info.resources[0].spec.template.spec.containers[0]
+             .livenessProbe.periodSeconds | default(10) | int }}
+        current_timeout: >-
+          {{ deployment_info.resources[0].spec.template.spec.containers[0]
+             .livenessProbe.timeoutSeconds | default(1) | int }}
+        current_failure_threshold: >-
+          {{ deployment_info.resources[0].spec.template.spec.containers[0]
+             .livenessProbe.failureThreshold | default(3) | int }}
+        container_name: >-
+          {{ deployment_info.resources[0].spec.template.spec.containers[0].name }}
+
+    - name: Compute new probe values dynamically
+      set_fact:
+        new_initial_delay: "{{ (current_initial_delay | int * 1.5) | int }}"
+        new_period: "{{ (current_period | int * 1.5) | int }}"
+        new_timeout: "{{ (current_timeout | int * 1.5) | int }}"
+        new_failure_threshold: "{{ (current_failure_threshold | int + 2) | int }}"
+
+    - name: Log current and new probe values
+      debug:
+        msg: >
+          Deployment: {{ deployment_name }} | namespace: {{ alert_namespace }}
+          | initialDelaySeconds: {{ current_initial_delay }} → {{ new_initial_delay }}
+          | periodSeconds: {{ current_period }} → {{ new_period }}
+          | timeoutSeconds: {{ current_timeout }} → {{ new_timeout }}
+          | failureThreshold: {{ current_failure_threshold }} → {{ new_failure_threshold }}
+
+    - name: Patch liveness probe with relaxed values
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig_path }}"
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: "{{ deployment_name }}"
+            namespace: "{{ alert_namespace }}"
+          spec:
+            template:
+              spec:
+                containers:
+                  - name: "{{ container_name }}"
+                    livenessProbe:
+                      initialDelaySeconds: "{{ new_initial_delay | int }}"
+                      periodSeconds: "{{ new_period | int }}"
+                      timeoutSeconds: "{{ new_timeout | int }}"
+                      failureThreshold: "{{ new_failure_threshold | int }}"
+        merge_type: strategic-merge
+
+    - name: Wait for deployment rollout
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig_path }}"
+        api_version: apps/v1
+        kind: Deployment
+        name: "{{ deployment_name }}"
+        namespace: "{{ alert_namespace }}"
+        wait: true
+        wait_condition:
+          type: Available
+          status: "True"
+        wait_timeout: 120
+      register: rollout_result
+
+    - name: Report remediation result
+      debug:
+        msg: >
+          Remediation complete for {{ deployment_name }}.
+          New liveness probe → initialDelay: {{ new_initial_delay }}s |
+          period: {{ new_period }}s | timeout: {{ new_timeout }}s |
+          failureThreshold: {{ new_failure_threshold }}.

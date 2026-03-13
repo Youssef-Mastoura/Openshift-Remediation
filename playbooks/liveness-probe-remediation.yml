@@ -51,7 +51,7 @@
       set_fact:
         new_initial_delay: "{{ (current_initial_delay | int * 1.5) | int }}"
         new_period: "{{ (current_period | int * 1.5) | int }}"
-        new_timeout: "{{ (current_timeout | int * 1.5) | int }}"
+        new_timeout: "{{ [[current_timeout | int * 1.5 | int, current_timeout | int + 1] | max, 2] | max }}"
         new_failure_threshold: "{{ (current_failure_threshold | int + 2) | int }}"
 
     - name: Log current and new probe values

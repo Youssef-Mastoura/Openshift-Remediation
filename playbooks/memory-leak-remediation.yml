@@ -8,68 +8,111 @@
 
   tasks:
 
-    - name: Extract alert info from event
+    - name: Extract pod and namespace from alert
       set_fact:
         alert_pod: "{{ event.payload.alerts[0].labels.pod }}"
-        remediation_type: "{{ event.payload.alerts[0].labels.remediation }}"
-
-    - name: Log remediation start
-      debug:
-        msg: "Memory leak alert fired — pod={{ alert_pod }} remediation={{ remediation_type }}"
+        alert_namespace: "{{ event.payload.alerts[0].labels.namespace | default('ms-demo') }}"
 
     - name: Derive deployment name from pod name
       set_fact:
         deployment_name: "{{ alert_pod | regex_replace('-[a-z0-9]+-[a-z0-9]+$', '') }}"
 
-    - name: Log derived deployment name
+    - name: Log remediation start
       debug:
-        msg: "Derived deployment name: {{ deployment_name }}"
+        msg: "Memory leak detected — pod={{ alert_pod }} deployment={{ deployment_name }}"
 
     # ─────────────────────────────────────────────
-    # CHECK RECURRENCE — AAP job history last 24h
+    # CHECK PREVIOUS REPLICASETS
     # ─────────────────────────────────────────────
 
-    - name: Check previous memory-leak remediations in last 24h
-      uri:
-        url: "https://{{ aap_host }}/api/v2/jobs/"
-        method: GET
-        headers:
-          Authorization: "Bearer {{ aap_token }}"
-        params:
-          name: "memory-leak-remediation"
-          status: "successful"
-          created__gte: "{{ '%Y-%m-%dT%H:%M:%SZ' | strftime((ansible_date_time.epoch | int) - 86400) }}"
+    - name: Get all ReplicaSets for this deployment
+      kubernetes.core.k8s_info:
+        kind: ReplicaSet
+        namespace: "{{ alert_namespace }}"
         validate_certs: false
-      register: previous_jobs
+        label_selectors:
+          - "app={{ deployment_name }}"
+      register: all_rs
 
-    - name: Log recurrence count
+    - name: Filter ReplicaSets that have a previous revision
+      set_fact:
+        previous_rs: >-
+          {{ all_rs.resources
+             | selectattr('metadata.annotations', 'defined')
+             | selectattr('metadata.annotations["deployment.kubernetes.io/revision"]', 'defined')
+             | sort(attribute='metadata.annotations["deployment.kubernetes.io/revision"]')
+             | list }}
+
+    - name: Check if a previous revision exists
+      set_fact:
+        has_previous_revision: "{{ previous_rs | length > 1 }}"
+
+    - name: Log revision check result
       debug:
-        msg: "Previous memory-leak remediations in last 24h: {{ previous_jobs.json.count }}"
+        msg: "Previous revision exists: {{ has_previous_revision }} — total RS found: {{ previous_rs | length }}"
 
     # ─────────────────────────────────────────────
-    # REMEDIATION — Graceful rolling restart
+    # PATH A — Rollback (previous revision exists)
     # ─────────────────────────────────────────────
 
-    - name: Perform graceful rolling restart to clear leaked memory
+    - name: "[Rollback] Perform oc rollout undo"
       kubernetes.core.k8s:
         validate_certs: false
         state: patched
         kind: Deployment
         name: "{{ deployment_name }}"
-        namespace: "{{ app_namespace }}"
+        namespace: "{{ alert_namespace }}"
+        definition:
+          metadata:
+            annotations:
+              remediation/memory-leak-rollback-at: "{{ ansible_date_time.iso8601 }}"
+      when: has_previous_revision | bool
+
+    - name: "[Rollback] Execute rollout undo via command"
+      command: >
+        oc rollout undo deployment/{{ deployment_name }} -n {{ alert_namespace }}
+      when: has_previous_revision | bool
+      register: rollout_undo_result
+
+    - name: "[Rollback] Log rollback result"
+      debug:
+        msg: "{{ rollout_undo_result.stdout }}"
+      when: has_previous_revision | bool
+
+    # ─────────────────────────────────────────────
+    # PATH B — Restart (no previous revision)
+    # ─────────────────────────────────────────────
+
+    - name: "[Restart] No previous revision — performing rolling restart instead"
+      kubernetes.core.k8s:
+        validate_certs: false
+        state: patched
+        kind: Deployment
+        name: "{{ deployment_name }}"
+        namespace: "{{ alert_namespace }}"
         definition:
           spec:
             template:
               metadata:
                 annotations:
                   kubectl.kubernetes.io/restartedAt: "{{ ansible_date_time.iso8601 }}"
-                  remediation/memory-leak-cleared-at: "{{ ansible_date_time.iso8601 }}"
+                  remediation/memory-leak-restart-at: "{{ ansible_date_time.iso8601 }}"
+      when: not (has_previous_revision | bool)
 
-    - name: Wait for rollout to complete
+    - name: "[Restart] Log restart applied"
+      debug:
+        msg: "No previous revision found for {{ deployment_name }} — rolling restart applied as fallback"
+      when: not (has_previous_revision | bool)
+
+    # ─────────────────────────────────────────────
+    # WAIT FOR ROLLOUT
+    # ─────────────────────────────────────────────
+
+    - name: Wait for deployment rollout to complete
       kubernetes.core.k8s_info:
         kind: Deployment
         name: "{{ deployment_name }}"
-        namespace: "{{ app_namespace }}"
+        namespace: "{{ alert_namespace }}"
         validate_certs: false
       register: rollout_status
       until: >-
@@ -80,17 +123,110 @@
       delay: 10
 
     # ─────────────────────────────────────────────
-    # ESCALATION — Recurring leak detected
+    # GET CURRENT IMAGE AFTER ACTION
     # ─────────────────────────────────────────────
 
-    - name: Log escalation if recurring
-      debug:
-        msg: >
-          ⚠️ ESCALATION — {{ deployment_name }} restarted for memory leak
-          {{ previous_jobs.json.count + 1 }} time(s) in last 24h.
-          This is a code-level bug — developer investigation required.
-          Automatic mitigation applied: rolling restart cleared leaked memory.
-      when: previous_jobs.json.count >= 1
+    - name: Get current image after remediation
+      set_fact:
+        current_image: >-
+          {{ rollout_status.resources[0].spec.template.spec.containers[0].image }}
+
+    # ─────────────────────────────────────────────
+    # SEND EMAIL — Path A (rollback succeeded)
+    # ─────────────────────────────────────────────
+
+    - name: "[Email] Send rollback notification"
+      mail:
+        host: smtp.gmail.com
+        port: 587
+        username: "{{ smtp_user }}"
+        password: "{{ smtp_password }}"
+        to: "{{ smtp_user }}"
+        subject: "🔁 [RF-02] Memory Leak Detected & Rolled Back — {{ deployment_name }}"
+        body: |
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          RF-02 Autonomous Remediation Platform — Alert
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+          Severity    : WARNING
+          Scenario    : S5 — Memory Leak Proactive Detection
+          Time        : {{ ansible_date_time.iso8601 }}
+
+          ── Affected Service ──────────────────────────
+          Deployment  : {{ deployment_name }}
+          Pod         : {{ alert_pod }}
+          Namespace   : {{ alert_namespace }}
+
+          ── Detection ─────────────────────────────────
+          Method      : predict_linear — memory projected to
+                        exceed 90% of limit within 30 minutes.
+          Action      : Automatic rollback to previous revision.
+
+          ── Remediation Applied ───────────────────────
+          Action      : oc rollout undo
+          Current image after rollback : {{ current_image }}
+          Status      : Rollout complete — service healthy.
+
+          ── Required Action ───────────────────────────
+          The previous deployment version contained a memory
+          leak bug. The rollback removed it from production.
+          Please investigate the memory leak in the reverted
+          version before redeploying.
+
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          This is an automated message from RF-02.
+          Do not reply to this email.
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      when: has_previous_revision | bool
+
+    # ─────────────────────────────────────────────
+    # SEND EMAIL — Path B (no rollback, restart only)
+    # ─────────────────────────────────────────────
+
+    - name: "[Email] Send restart notification — no previous revision"
+      mail:
+        host: smtp.gmail.com
+        port: 587
+        username: "{{ smtp_user }}"
+        password: "{{ smtp_password }}"
+        to: "{{ smtp_user }}"
+        subject: "⚠️ [RF-02] Memory Leak Detected — Manual Fix Required — {{ deployment_name }}"
+        body: |
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          RF-02 Autonomous Remediation Platform — Alert
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+          Severity    : WARNING
+          Scenario    : S5 — Memory Leak Proactive Detection
+          Time        : {{ ansible_date_time.iso8601 }}
+
+          ── Affected Service ──────────────────────────
+          Deployment  : {{ deployment_name }}
+          Pod         : {{ alert_pod }}
+          Namespace   : {{ alert_namespace }}
+
+          ── Detection ─────────────────────────────────
+          Method      : predict_linear — memory projected to
+                        exceed 90% of limit within 30 minutes.
+
+          ── Remediation Applied ───────────────────────
+          Action      : Rolling restart (memory cleared).
+          Reason      : No previous revision found —
+                        rollback was not possible.
+          Current image : {{ current_image }}
+          Status      : Rollout complete — service healthy.
+
+          ── ⚠️ Manual Intervention Required ──────────
+          No previous deployment revision exists for
+          {{ deployment_name }}. The memory leak bug is
+          still present in the running image.
+          Please fix the code and redeploy immediately.
+
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          This is an automated message from RF-02.
+          Do not reply to this email.
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      when: not (has_previous_revision | bool)
 
     # ─────────────────────────────────────────────
     # FINAL REPORT
@@ -99,8 +235,7 @@
     - name: Report remediation complete
       debug:
         msg: >
-          S5 remediation complete for {{ deployment_name }}
-          | cause: memory-leak
-          | namespace: {{ app_namespace }}
-          | occurrences today: {{ previous_jobs.json.count + 1 }}
-          | action: rolling restart — memory cleared with zero downtime
+          S5 remediation complete — deployment={{ deployment_name }}
+          | rollback={{ has_previous_revision }}
+          | current_image={{ current_image }}
+          | email sent to {{ smtp_user }}

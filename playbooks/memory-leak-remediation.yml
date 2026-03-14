@@ -34,7 +34,7 @@
           - "app={{ deployment_name }}"
       register: all_rs
 
-    - name: Filter ReplicaSets that have a previous revision
+    - name: Filter ReplicaSets by revision
       set_fact:
         previous_rs: >-
           {{ all_rs.resources
@@ -55,20 +55,7 @@
     # PATH A — Rollback (previous revision exists)
     # ─────────────────────────────────────────────
 
-    - name: "[Rollback] Perform oc rollout undo"
-      kubernetes.core.k8s:
-        validate_certs: false
-        state: patched
-        kind: Deployment
-        name: "{{ deployment_name }}"
-        namespace: "{{ alert_namespace }}"
-        definition:
-          metadata:
-            annotations:
-              remediation/memory-leak-rollback-at: "{{ ansible_date_time.iso8601 }}"
-      when: has_previous_revision | bool
-
-    - name: "[Rollback] Execute rollout undo via command"
+    - name: "[Rollback] Execute rollout undo"
       command: >
         oc rollout undo deployment/{{ deployment_name }} -n {{ alert_namespace }}
       when: has_previous_revision | bool
@@ -83,7 +70,7 @@
     # PATH B — Restart (no previous revision)
     # ─────────────────────────────────────────────
 
-    - name: "[Restart] No previous revision — performing rolling restart instead"
+    - name: "[Restart] No previous revision — performing rolling restart"
       kubernetes.core.k8s:
         validate_certs: false
         state: patched
@@ -132,51 +119,74 @@
           {{ rollout_status.resources[0].spec.template.spec.containers[0].image }}
 
     # ─────────────────────────────────────────────
+    # CHECK RECURRENCE
+    # ─────────────────────────────────────────────
+
+    - name: Check previous memory-leak remediations in last 24h
+      uri:
+        url: "https://{{ aap_host }}/api/v2/jobs/"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ aap_token }}"
+        params:
+          name: "memory-leak-remediation"
+          status: "successful"
+          created__gte: "{{ '%Y-%m-%dT%H:%M:%SZ' | strftime((ansible_date_time.epoch | int) - 86400) }}"
+        validate_certs: false
+      register: previous_jobs
+
+    - name: Log recurrence count
+      debug:
+        msg: "Previous memory-leak remediations in last 24h: {{ previous_jobs.json.count }}"
+
+    # ─────────────────────────────────────────────
     # SEND EMAIL — Path A (rollback succeeded)
     # ─────────────────────────────────────────────
 
     - name: "[Email] Send rollback notification"
-      mail:
-        host: smtp.gmail.com
-        port: 587
-        username: "{{ smtp_user }}"
-        password: "{{ smtp_password }}"
-        to: "{{ smtp_user }}"
-        subject: "🔁 [RF-02] Memory Leak Detected & Rolled Back — {{ deployment_name }}"
-        body: |
-          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-          RF-02 Autonomous Remediation Platform — Alert
-          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      command: >
+        python3 -c "
+        import smtplib
+        from email.mime.text import MIMEText
+        msg = MIMEText('''RF-02 Autonomous Remediation Platform — Alert
 
-          Severity    : WARNING
-          Scenario    : S5 — Memory Leak Proactive Detection
-          Time        : {{ ansible_date_time.iso8601 }}
+Severity    : WARNING
+Scenario    : S5 — Memory Leak Proactive Detection
+Time        : {{ ansible_date_time.iso8601 }}
 
-          ── Affected Service ──────────────────────────
-          Deployment  : {{ deployment_name }}
-          Pod         : {{ alert_pod }}
-          Namespace   : {{ alert_namespace }}
+Affected Service
+Deployment  : {{ deployment_name }}
+Pod         : {{ alert_pod }}
+Namespace   : {{ alert_namespace }}
 
-          ── Detection ─────────────────────────────────
-          Method      : predict_linear — memory projected to
-                        exceed 90% of limit within 30 minutes.
-          Action      : Automatic rollback to previous revision.
+Detection
+Method      : predict_linear — memory projected to exceed
+              70% of limit within 10 minutes.
+Action      : Automatic rollback to previous revision.
 
-          ── Remediation Applied ───────────────────────
-          Action      : oc rollout undo
-          Current image after rollback : {{ current_image }}
-          Status      : Rollout complete — service healthy.
+Remediation Applied
+Action      : oc rollout undo
+Image after rollback : {{ current_image }}
+Occurrences today    : {{ previous_jobs.json.count + 1 }}
+Status      : Rollout complete — service healthy.
 
-          ── Required Action ───────────────────────────
-          The previous deployment version contained a memory
-          leak bug. The rollback removed it from production.
-          Please investigate the memory leak in the reverted
-          version before redeploying.
+Required Action
+The previous deployment version contained a memory leak bug.
+The rollback removed it from production.
+Please investigate the memory leak before redeploying.
 
-          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-          This is an automated message from RF-02.
-          Do not reply to this email.
-          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+This is an automated message from RF-02.
+Do not reply to this email.''')
+        msg['Subject'] = '[RF-02] Memory Leak Detected and Rolled Back — {{ deployment_name }}'
+        msg['From'] = '{{ smtp_user }}'
+        msg['To'] = '{{ smtp_user }}'
+        s = smtplib.SMTP('smtp.gmail.com', 587)
+        s.starttls()
+        s.login('{{ smtp_user }}', '{{ smtp_password }}')
+        s.sendmail('{{ smtp_user }}', '{{ smtp_user }}', msg.as_string())
+        s.quit()
+        print('Email sent successfully')
+        "
       when: has_previous_revision | bool
 
     # ─────────────────────────────────────────────
@@ -184,48 +194,49 @@
     # ─────────────────────────────────────────────
 
     - name: "[Email] Send restart notification — no previous revision"
-      mail:
-        host: smtp.gmail.com
-        port: 587
-        username: "{{ smtp_user }}"
-        password: "{{ smtp_password }}"
-        to: "{{ smtp_user }}"
-        subject: "⚠️ [RF-02] Memory Leak Detected — Manual Fix Required — {{ deployment_name }}"
-        body: |
-          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-          RF-02 Autonomous Remediation Platform — Alert
-          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      command: >
+        python3 -c "
+        import smtplib
+        from email.mime.text import MIMEText
+        msg = MIMEText('''RF-02 Autonomous Remediation Platform — Alert
 
-          Severity    : WARNING
-          Scenario    : S5 — Memory Leak Proactive Detection
-          Time        : {{ ansible_date_time.iso8601 }}
+Severity    : WARNING
+Scenario    : S5 — Memory Leak Proactive Detection
+Time        : {{ ansible_date_time.iso8601 }}
 
-          ── Affected Service ──────────────────────────
-          Deployment  : {{ deployment_name }}
-          Pod         : {{ alert_pod }}
-          Namespace   : {{ alert_namespace }}
+Affected Service
+Deployment  : {{ deployment_name }}
+Pod         : {{ alert_pod }}
+Namespace   : {{ alert_namespace }}
 
-          ── Detection ─────────────────────────────────
-          Method      : predict_linear — memory projected to
-                        exceed 90% of limit within 30 minutes.
+Detection
+Method      : predict_linear — memory projected to exceed
+              70% of limit within 10 minutes.
 
-          ── Remediation Applied ───────────────────────
-          Action      : Rolling restart (memory cleared).
-          Reason      : No previous revision found —
-                        rollback was not possible.
-          Current image : {{ current_image }}
-          Status      : Rollout complete — service healthy.
+Remediation Applied
+Action      : Rolling restart (memory cleared).
+Reason      : No previous revision found — rollback not possible.
+Current image : {{ current_image }}
+Occurrences today : {{ previous_jobs.json.count + 1 }}
+Status      : Rollout complete — service healthy.
 
-          ── ⚠️ Manual Intervention Required ──────────
-          No previous deployment revision exists for
-          {{ deployment_name }}. The memory leak bug is
-          still present in the running image.
-          Please fix the code and redeploy immediately.
+Manual Intervention Required
+No previous deployment revision exists for {{ deployment_name }}.
+The memory leak bug is still present in the running image.
+Please fix the code and redeploy immediately.
 
-          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-          This is an automated message from RF-02.
-          Do not reply to this email.
-          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+This is an automated message from RF-02.
+Do not reply to this email.''')
+        msg['Subject'] = '[RF-02] Memory Leak Detected — Manual Fix Required — {{ deployment_name }}'
+        msg['From'] = '{{ smtp_user }}'
+        msg['To'] = '{{ smtp_user }}'
+        s = smtplib.SMTP('smtp.gmail.com', 587)
+        s.starttls()
+        s.login('{{ smtp_user }}', '{{ smtp_password }}')
+        s.sendmail('{{ smtp_user }}', '{{ smtp_user }}', msg.as_string())
+        s.quit()
+        print('Email sent successfully')
+        "
       when: not (has_previous_revision | bool)
 
     # ─────────────────────────────────────────────
@@ -238,4 +249,5 @@
           S5 remediation complete — deployment={{ deployment_name }}
           | rollback={{ has_previous_revision }}
           | current_image={{ current_image }}
+          | occurrences today={{ previous_jobs.json.count + 1 }}
           | email sent to {{ smtp_user }}

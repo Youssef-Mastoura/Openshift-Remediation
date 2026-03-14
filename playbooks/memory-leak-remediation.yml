@@ -8,6 +8,11 @@
 
   tasks:
 
+    - name: Parse event from extra vars
+      set_fact:
+        event: "{{ event | from_json }}"
+      when: event is string
+
     - name: Extract pod and namespace from alert
       set_fact:
         alert_pod: "{{ event.payload.alerts[0].labels.pod }}"

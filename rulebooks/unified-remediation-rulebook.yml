@@ -87,3 +87,13 @@
           job_args:
             extra_vars:
               event: "{{ event }}"
+              
+    - name: Trigger Memory Leak Fix
+      condition: event.payload.alerts is selectattr("labels.remediation", "==", "memory-leak")
+      action:
+        run_job_template:
+          name: "memory-leak-remediation"
+          organization: "Default"
+          job_args:
+            extra_vars:
+              event: "{{ event }}"

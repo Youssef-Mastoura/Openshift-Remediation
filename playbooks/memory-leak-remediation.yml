@@ -216,6 +216,7 @@
       copy:
         content: "{{ email_body_rollback }}"
         dest: /tmp/rf02_email_body.txt
+      no_log: true
       when: has_previous_revision | bool
 
     - name: "[Email] Write rollback send script"
@@ -235,6 +236,7 @@
           s.sendmail('{{ smtp_user }}', '{{ smtp_user }}', msg.as_string())
           s.quit()
           print('Email sent successfully')
+      no_log: true
       when: has_previous_revision | bool
 
     - name: "[Email] Send rollback notification"
@@ -249,6 +251,7 @@
       copy:
         content: "{{ email_body_restart }}"
         dest: /tmp/rf02_email_body.txt
+      no_log: true
       when: not (has_previous_revision | bool)
 
     - name: "[Email] Write restart send script"
@@ -268,6 +271,7 @@
           s.sendmail('{{ smtp_user }}', '{{ smtp_user }}', msg.as_string())
           s.quit()
           print('Email sent successfully')
+      no_log: true
       when: not (has_previous_revision | bool)
 
     - name: "[Email] Send restart notification"

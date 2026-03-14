@@ -8,11 +8,6 @@
 
   tasks:
 
-    - name: Parse event from extra vars
-      set_fact:
-        event: "{{ event | from_json }}"
-      when: event is string
-
     - name: Extract pod and namespace from alert
       set_fact:
         alert_pod: "{{ event.payload.alerts[0].labels.pod }}"
@@ -220,6 +215,12 @@
     # SEND EMAIL — Path A (rollback succeeded)
     # ─────────────────────────────────────────────
 
+    - name: "[Email] Write rollback email body to temp file"
+      copy:
+        content: "{{ email_body_rollback }}"
+        dest: /tmp/rf02_email_body.txt
+      when: has_previous_revision | bool
+
     - name: "[Email] Send rollback notification"
       command: >-
         python3 -c "
@@ -237,12 +238,6 @@
         s.quit();
         print('Email sent successfully')
         "
-      when: has_previous_revision | bool
-
-    - name: "[Email] Write rollback email body to temp file"
-      copy:
-        content: "{{ email_body_rollback }}"
-        dest: /tmp/rf02_email_body.txt
       when: has_previous_revision | bool
 
     # ─────────────────────────────────────────────

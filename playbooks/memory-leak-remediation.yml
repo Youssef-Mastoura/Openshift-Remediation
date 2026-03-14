@@ -140,101 +140,131 @@
         msg: "Previous memory-leak remediations in last 24h: {{ previous_jobs.json.count }}"
 
     # ─────────────────────────────────────────────
+    # PREPARE EMAIL BODIES
+    # ─────────────────────────────────────────────
+
+    - name: Prepare rollback email body
+      set_fact:
+        email_subject_rollback: "[RF-02] Memory Leak Detected and Rolled Back - {{ deployment_name }}"
+        email_body_rollback: |
+          RF-02 Autonomous Remediation Platform - Alert
+
+          Severity    - WARNING
+          Scenario    - S5 Memory Leak Proactive Detection
+          Time        - {{ ansible_date_time.iso8601 }}
+
+          Affected Service
+          Deployment  - {{ deployment_name }}
+          Pod         - {{ alert_pod }}
+          Namespace   - {{ alert_namespace }}
+
+          Detection
+          Method      - predict_linear memory projected to exceed
+                        70 percent of limit within 10 minutes.
+          Action      - Automatic rollback to previous revision.
+
+          Remediation Applied
+          Action           - oc rollout undo
+          Image after rollback - {{ current_image }}
+          Occurrences today    - {{ previous_jobs.json.count + 1 }}
+          Status               - Rollout complete service healthy.
+
+          Required Action
+          The previous deployment version contained a memory leak bug.
+          The rollback removed it from production.
+          Please investigate the memory leak before redeploying.
+
+          This is an automated message from RF-02.
+          Do not reply to this email.
+
+    - name: Prepare restart email body
+      set_fact:
+        email_subject_restart: "[RF-02] Memory Leak Detected - Manual Fix Required - {{ deployment_name }}"
+        email_body_restart: |
+          RF-02 Autonomous Remediation Platform - Alert
+
+          Severity    - WARNING
+          Scenario    - S5 Memory Leak Proactive Detection
+          Time        - {{ ansible_date_time.iso8601 }}
+
+          Affected Service
+          Deployment  - {{ deployment_name }}
+          Pod         - {{ alert_pod }}
+          Namespace   - {{ alert_namespace }}
+
+          Detection
+          Method      - predict_linear memory projected to exceed
+                        70 percent of limit within 10 minutes.
+
+          Remediation Applied
+          Action            - Rolling restart memory cleared.
+          Reason            - No previous revision found rollback not possible.
+          Current image     - {{ current_image }}
+          Occurrences today - {{ previous_jobs.json.count + 1 }}
+          Status            - Rollout complete service healthy.
+
+          Manual Intervention Required
+          No previous deployment revision exists for {{ deployment_name }}.
+          The memory leak bug is still present in the running image.
+          Please fix the code and redeploy immediately.
+
+          This is an automated message from RF-02.
+          Do not reply to this email.
+
+    # ─────────────────────────────────────────────
     # SEND EMAIL — Path A (rollback succeeded)
     # ─────────────────────────────────────────────
 
     - name: "[Email] Send rollback notification"
-      command: >
+      command: >-
         python3 -c "
-        import smtplib
-        from email.mime.text import MIMEText
-        msg = MIMEText('''RF-02 Autonomous Remediation Platform — Alert
-
-Severity    : WARNING
-Scenario    : S5 — Memory Leak Proactive Detection
-Time        : {{ ansible_date_time.iso8601 }}
-
-Affected Service
-Deployment  : {{ deployment_name }}
-Pod         : {{ alert_pod }}
-Namespace   : {{ alert_namespace }}
-
-Detection
-Method      : predict_linear — memory projected to exceed
-              70% of limit within 10 minutes.
-Action      : Automatic rollback to previous revision.
-
-Remediation Applied
-Action      : oc rollout undo
-Image after rollback : {{ current_image }}
-Occurrences today    : {{ previous_jobs.json.count + 1 }}
-Status      : Rollout complete — service healthy.
-
-Required Action
-The previous deployment version contained a memory leak bug.
-The rollback removed it from production.
-Please investigate the memory leak before redeploying.
-
-This is an automated message from RF-02.
-Do not reply to this email.''')
-        msg['Subject'] = '[RF-02] Memory Leak Detected and Rolled Back — {{ deployment_name }}'
-        msg['From'] = '{{ smtp_user }}'
-        msg['To'] = '{{ smtp_user }}'
-        s = smtplib.SMTP('smtp.gmail.com', 587)
-        s.starttls()
-        s.login('{{ smtp_user }}', '{{ smtp_password }}')
-        s.sendmail('{{ smtp_user }}', '{{ smtp_user }}', msg.as_string())
-        s.quit()
+        import smtplib;
+        from email.mime.text import MIMEText;
+        body = open('/tmp/rf02_email_body.txt').read();
+        msg = MIMEText(body);
+        msg['Subject'] = '{{ email_subject_rollback }}';
+        msg['From'] = '{{ smtp_user }}';
+        msg['To'] = '{{ smtp_user }}';
+        s = smtplib.SMTP('smtp.gmail.com', 587);
+        s.starttls();
+        s.login('{{ smtp_user }}', '{{ smtp_password }}');
+        s.sendmail('{{ smtp_user }}', '{{ smtp_user }}', msg.as_string());
+        s.quit();
         print('Email sent successfully')
         "
+      when: has_previous_revision | bool
+
+    - name: "[Email] Write rollback email body to temp file"
+      copy:
+        content: "{{ email_body_rollback }}"
+        dest: /tmp/rf02_email_body.txt
       when: has_previous_revision | bool
 
     # ─────────────────────────────────────────────
     # SEND EMAIL — Path B (no rollback, restart only)
     # ─────────────────────────────────────────────
 
-    - name: "[Email] Send restart notification — no previous revision"
-      command: >
+    - name: "[Email] Write restart email body to temp file"
+      copy:
+        content: "{{ email_body_restart }}"
+        dest: /tmp/rf02_email_body.txt
+      when: not (has_previous_revision | bool)
+
+    - name: "[Email] Send restart notification"
+      command: >-
         python3 -c "
-        import smtplib
-        from email.mime.text import MIMEText
-        msg = MIMEText('''RF-02 Autonomous Remediation Platform — Alert
-
-Severity    : WARNING
-Scenario    : S5 — Memory Leak Proactive Detection
-Time        : {{ ansible_date_time.iso8601 }}
-
-Affected Service
-Deployment  : {{ deployment_name }}
-Pod         : {{ alert_pod }}
-Namespace   : {{ alert_namespace }}
-
-Detection
-Method      : predict_linear — memory projected to exceed
-              70% of limit within 10 minutes.
-
-Remediation Applied
-Action      : Rolling restart (memory cleared).
-Reason      : No previous revision found — rollback not possible.
-Current image : {{ current_image }}
-Occurrences today : {{ previous_jobs.json.count + 1 }}
-Status      : Rollout complete — service healthy.
-
-Manual Intervention Required
-No previous deployment revision exists for {{ deployment_name }}.
-The memory leak bug is still present in the running image.
-Please fix the code and redeploy immediately.
-
-This is an automated message from RF-02.
-Do not reply to this email.''')
-        msg['Subject'] = '[RF-02] Memory Leak Detected — Manual Fix Required — {{ deployment_name }}'
-        msg['From'] = '{{ smtp_user }}'
-        msg['To'] = '{{ smtp_user }}'
-        s = smtplib.SMTP('smtp.gmail.com', 587)
-        s.starttls()
-        s.login('{{ smtp_user }}', '{{ smtp_password }}')
-        s.sendmail('{{ smtp_user }}', '{{ smtp_user }}', msg.as_string())
-        s.quit()
+        import smtplib;
+        from email.mime.text import MIMEText;
+        body = open('/tmp/rf02_email_body.txt').read();
+        msg = MIMEText(body);
+        msg['Subject'] = '{{ email_subject_restart }}';
+        msg['From'] = '{{ smtp_user }}';
+        msg['To'] = '{{ smtp_user }}';
+        s = smtplib.SMTP('smtp.gmail.com', 587);
+        s.starttls();
+        s.login('{{ smtp_user }}', '{{ smtp_password }}');
+        s.sendmail('{{ smtp_user }}', '{{ smtp_user }}', msg.as_string());
+        s.quit();
         print('Email sent successfully')
         "
       when: not (has_previous_revision | bool)

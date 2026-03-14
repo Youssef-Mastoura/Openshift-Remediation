@@ -218,23 +218,27 @@
         dest: /tmp/rf02_email_body.txt
       when: has_previous_revision | bool
 
+    - name: "[Email] Write rollback send script"
+      copy:
+        dest: /tmp/rf02_send_email.py
+        content: |
+          import smtplib
+          from email.mime.text import MIMEText
+          body = open('/tmp/rf02_email_body.txt').read()
+          msg = MIMEText(body)
+          msg['Subject'] = '{{ email_subject_rollback }}'
+          msg['From'] = '{{ smtp_user }}'
+          msg['To'] = '{{ smtp_user }}'
+          s = smtplib.SMTP('smtp.gmail.com', 587)
+          s.starttls()
+          s.login('{{ smtp_user }}', '{{ smtp_password }}')
+          s.sendmail('{{ smtp_user }}', '{{ smtp_user }}', msg.as_string())
+          s.quit()
+          print('Email sent successfully')
+      when: has_previous_revision | bool
+
     - name: "[Email] Send rollback notification"
-      command: >-
-        python3 -c "
-        import smtplib;
-        from email.mime.text import MIMEText;
-        body = open('/tmp/rf02_email_body.txt').read();
-        msg = MIMEText(body);
-        msg['Subject'] = '{{ email_subject_rollback }}';
-        msg['From'] = '{{ smtp_user }}';
-        msg['To'] = '{{ smtp_user }}';
-        s = smtplib.SMTP('smtp.gmail.com', 587);
-        s.starttls();
-        s.login('{{ smtp_user }}', '{{ smtp_password }}');
-        s.sendmail('{{ smtp_user }}', '{{ smtp_user }}', msg.as_string());
-        s.quit();
-        print('Email sent successfully')
-        "
+      command: python3 /tmp/rf02_send_email.py
       when: has_previous_revision | bool
 
     # ─────────────────────────────────────────────
@@ -247,23 +251,27 @@
         dest: /tmp/rf02_email_body.txt
       when: not (has_previous_revision | bool)
 
+    - name: "[Email] Write restart send script"
+      copy:
+        dest: /tmp/rf02_send_email.py
+        content: |
+          import smtplib
+          from email.mime.text import MIMEText
+          body = open('/tmp/rf02_email_body.txt').read()
+          msg = MIMEText(body)
+          msg['Subject'] = '{{ email_subject_restart }}'
+          msg['From'] = '{{ smtp_user }}'
+          msg['To'] = '{{ smtp_user }}'
+          s = smtplib.SMTP('smtp.gmail.com', 587)
+          s.starttls()
+          s.login('{{ smtp_user }}', '{{ smtp_password }}')
+          s.sendmail('{{ smtp_user }}', '{{ smtp_user }}', msg.as_string())
+          s.quit()
+          print('Email sent successfully')
+      when: not (has_previous_revision | bool)
+
     - name: "[Email] Send restart notification"
-      command: >-
-        python3 -c "
-        import smtplib;
-        from email.mime.text import MIMEText;
-        body = open('/tmp/rf02_email_body.txt').read();
-        msg = MIMEText(body);
-        msg['Subject'] = '{{ email_subject_restart }}';
-        msg['From'] = '{{ smtp_user }}';
-        msg['To'] = '{{ smtp_user }}';
-        s = smtplib.SMTP('smtp.gmail.com', 587);
-        s.starttls();
-        s.login('{{ smtp_user }}', '{{ smtp_password }}');
-        s.sendmail('{{ smtp_user }}', '{{ smtp_user }}', msg.as_string());
-        s.quit();
-        print('Email sent successfully')
-        "
+      command: python3 /tmp/rf02_send_email.py
       when: not (has_previous_revision | bool)
 
     # ─────────────────────────────────────────────

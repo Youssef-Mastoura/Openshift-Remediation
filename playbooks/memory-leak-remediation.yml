@@ -1,0 +1,106 @@
+---
+- name: S5 - Memory Leak Proactive Remediation
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars:
+    app_namespace: ms-demo
+
+  tasks:
+
+    - name: Extract alert info from event
+      set_fact:
+        alert_pod: "{{ event.payload.alerts[0].labels.pod }}"
+        remediation_type: "{{ event.payload.alerts[0].labels.remediation }}"
+
+    - name: Log remediation start
+      debug:
+        msg: "Memory leak alert fired — pod={{ alert_pod }} remediation={{ remediation_type }}"
+
+    - name: Derive deployment name from pod name
+      set_fact:
+        deployment_name: "{{ alert_pod | regex_replace('-[a-z0-9]+-[a-z0-9]+$', '') }}"
+
+    - name: Log derived deployment name
+      debug:
+        msg: "Derived deployment name: {{ deployment_name }}"
+
+    # ─────────────────────────────────────────────
+    # CHECK RECURRENCE — AAP job history last 24h
+    # ─────────────────────────────────────────────
+
+    - name: Check previous memory-leak remediations in last 24h
+      uri:
+        url: "https://{{ aap_host }}/api/v2/jobs/"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ aap_token }}"
+        params:
+          name: "memory-leak-remediation"
+          status: "successful"
+          created__gte: "{{ '%Y-%m-%dT%H:%M:%SZ' | strftime((ansible_date_time.epoch | int) - 86400) }}"
+        validate_certs: false
+      register: previous_jobs
+
+    - name: Log recurrence count
+      debug:
+        msg: "Previous memory-leak remediations in last 24h: {{ previous_jobs.json.count }}"
+
+    # ─────────────────────────────────────────────
+    # REMEDIATION — Graceful rolling restart
+    # ─────────────────────────────────────────────
+
+    - name: Perform graceful rolling restart to clear leaked memory
+      kubernetes.core.k8s:
+        validate_certs: false
+        state: patched
+        kind: Deployment
+        name: "{{ deployment_name }}"
+        namespace: "{{ app_namespace }}"
+        definition:
+          spec:
+            template:
+              metadata:
+                annotations:
+                  kubectl.kubernetes.io/restartedAt: "{{ ansible_date_time.iso8601 }}"
+                  remediation/memory-leak-cleared-at: "{{ ansible_date_time.iso8601 }}"
+
+    - name: Wait for rollout to complete
+      kubernetes.core.k8s_info:
+        kind: Deployment
+        name: "{{ deployment_name }}"
+        namespace: "{{ app_namespace }}"
+        validate_certs: false
+      register: rollout_status
+      until: >-
+        rollout_status.resources[0].status.readyReplicas is defined and
+        rollout_status.resources[0].status.readyReplicas ==
+        rollout_status.resources[0].spec.replicas
+      retries: 18
+      delay: 10
+
+    # ─────────────────────────────────────────────
+    # ESCALATION — Recurring leak detected
+    # ─────────────────────────────────────────────
+
+    - name: Log escalation if recurring
+      debug:
+        msg: >
+          ⚠️ ESCALATION — {{ deployment_name }} restarted for memory leak
+          {{ previous_jobs.json.count + 1 }} time(s) in last 24h.
+          This is a code-level bug — developer investigation required.
+          Automatic mitigation applied: rolling restart cleared leaked memory.
+      when: previous_jobs.json.count >= 1
+
+    # ─────────────────────────────────────────────
+    # FINAL REPORT
+    # ─────────────────────────────────────────────
+
+    - name: Report remediation complete
+      debug:
+        msg: >
+          S5 remediation complete for {{ deployment_name }}
+          | cause: memory-leak
+          | namespace: {{ app_namespace }}
+          | occurrences today: {{ previous_jobs.json.count + 1 }}
+          | action: rolling restart — memory cleared with zero downtime

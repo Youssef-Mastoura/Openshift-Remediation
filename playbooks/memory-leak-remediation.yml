@@ -25,19 +25,18 @@
     # CHECK PREVIOUS REPLICASETS
     # ─────────────────────────────────────────────
 
-    - name: Get all ReplicaSets for this deployment
+    - name: Get all ReplicaSets in namespace
       kubernetes.core.k8s_info:
         kind: ReplicaSet
         namespace: "{{ alert_namespace }}"
         validate_certs: false
-        label_selectors:
-          - "app={{ deployment_name }}"
       register: all_rs
 
-    - name: Filter ReplicaSets by revision
+    - name: Filter ReplicaSets belonging to this deployment
       set_fact:
         previous_rs: >-
           {{ all_rs.resources
+             | selectattr('metadata.name', 'match', deployment_name + '-.*')
              | selectattr('metadata.annotations', 'defined')
              | selectattr('metadata.annotations["deployment.kubernetes.io/revision"]', 'defined')
              | sort(attribute='metadata.annotations["deployment.kubernetes.io/revision"]')

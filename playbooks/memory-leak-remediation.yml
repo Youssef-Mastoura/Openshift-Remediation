@@ -124,15 +124,12 @@
 
     - name: Check previous memory-leak remediations in last 24h
       uri:
-        url: "https://{{ aap_host }}/api/v2/jobs/"
+        url: "https://{{ aap_host }}/api/v2/jobs/?name=memory-leak-remediation&status=successful"
         method: GET
         headers:
           Authorization: "Bearer {{ aap_token }}"
-        params:
-          name: "memory-leak-remediation"
-          status: "successful"
-          created__gte: "{{ '%Y-%m-%dT%H:%M:%SZ' | strftime((ansible_date_time.epoch | int) - 86400) }}"
         validate_certs: false
+        return_content: true
       register: previous_jobs
 
     - name: Log recurrence count

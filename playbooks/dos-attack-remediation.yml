@@ -143,6 +143,7 @@
         namespace: "{{ app_namespace }}"
         replicas: "{{ new_replicas }}"
         validate_certs: false
+        wait: false
 
     - name: Wait for scaled deployment to become ready
       kubernetes.core.k8s_info:

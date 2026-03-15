@@ -5,9 +5,7 @@
     - ansible.eda.webhook:
         host: 0.0.0.0
         port: 5000
-
   rules:
-
     - name: Trigger OOMKilled Fix
       condition: event.payload.alerts is selectattr("labels.remediation", "==", "increase-mem")
       action:
@@ -17,7 +15,6 @@
           job_args:
             extra_vars:
               event: "{{ event }}"
-
     - name: Trigger Recurring OOMKilled Fix
       condition: event.payload.alerts is selectattr("labels.remediation", "==", "increase-mem-recurring")
       action:
@@ -27,7 +24,6 @@
           job_args:
             extra_vars:
               event: "{{ event }}"
-
     - name: Trigger ConfigMap Desync Fix
       condition: event.payload.alerts is selectattr("labels.remediation", "==", "configmap-desync")
       action:
@@ -37,7 +33,7 @@
           job_args:
             extra_vars:
               event: "{{ event }}"
-              
+
     - name: Trigger CPU Throttling Fix
       condition: event.payload.alerts is selectattr("labels.remediation", "==", "cpu-throttling")
       action:
@@ -47,7 +43,7 @@
           job_args:
             extra_vars:
               event: "{{ event }}"
-              
+
     - name: Trigger Deployment Regression Fix
       condition: event.payload.alerts is selectattr("labels.remediation", "==", "deployment-regression")
       action:
@@ -57,7 +53,7 @@
           job_args:
             extra_vars:
               event: "{{ event }}"
-              
+
     - name: Trigger Liveness Probe Fix
       condition: event.payload.alerts is selectattr("labels.remediation", "==", "liveness-probe")
       action:
@@ -67,7 +63,7 @@
           job_args:
             extra_vars:
               event: "{{ event }}"
-              
+
     - name: Trigger Pending Pod Unschedulable Fix
       condition: event.payload.alerts is selectattr("labels.remediation", "==", "pending-pod-unschedulable")
       action:
@@ -77,7 +73,6 @@
           job_args:
             extra_vars:
               event: "{{ event }}"
-
     - name: Trigger Pending Pod PVC Fix
       condition: event.payload.alerts is selectattr("labels.remediation", "==", "pending-pod-pvc")
       action:
@@ -87,7 +82,7 @@
           job_args:
             extra_vars:
               event: "{{ event }}"
-              
+
     - name: Trigger Memory Leak Fix
       condition: event.payload.alerts is selectattr("labels.remediation", "==", "memory-leak")
       action:
@@ -97,13 +92,13 @@
           job_args:
             extra_vars:
               event: "{{ event }}"
-              
-    - name: Handle CrashLoopBackOff Bad Entrypoint
-      condition: event.payload.alerts | selectattr('labels.remediation', 'equalto', 'crashloop-bad-entrypoint') | list | length > 0
+
+    - name: Trigger CrashLoopBackOff Bad Entrypoint Fix
+      condition: event.payload.alerts is selectattr("labels.remediation", "==", "crashloop-bad-entrypoint")
       action:
         run_job_template:
-          name: crashloop-remediation
-          organization: Default
+          name: "crashloop-remediation"
+          organization: "Default"
           job_args:
             extra_vars:
               event: "{{ event }}"

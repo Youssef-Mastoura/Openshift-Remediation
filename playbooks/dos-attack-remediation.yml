@@ -8,9 +8,8 @@
 
     # ─────────────────────────────────────────────
     # EXTRACT ALERT INFO
-    # alert namespace = openshift-ingress (router)
-    # app namespace   = ms-demo (where the app lives)
-    # These are always different — never mix them.
+    # The alert fires from openshift-ingress namespace
+    # but all remediation targets ms-demo namespace.
     # ─────────────────────────────────────────────
 
     - name: Extract alert info from event
@@ -24,9 +23,8 @@
 
     # ─────────────────────────────────────────────
     # FIND ROUTE IN ms-demo AND DERIVE SERVICE NAME
-    # Route lives in ms-demo. We look it up and read
-    # spec.to.name to get the backend service name
-    # dynamically — no hardcoded deployment names.
+    # Read spec.to.name from route to get backend
+    # service name dynamically — no hardcoding.
     # ─────────────────────────────────────────────
 
     - name: Get route from ms-demo namespace

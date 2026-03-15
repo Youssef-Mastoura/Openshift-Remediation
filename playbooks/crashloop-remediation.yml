@@ -1,0 +1,214 @@
+---
+- name: S6 - CrashLoopBackOff Bad Entrypoint Remediation
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars:
+    app_namespace: ms-demo
+
+  tasks:
+
+    # ─────────────────────────────────────────────
+    # EXTRACT ALERT INFO
+    # ─────────────────────────────────────────────
+
+    - name: Extract pod and namespace from alert
+      set_fact:
+        alert_pod: "{{ event.payload.alerts[0].labels.pod }}"
+        alert_namespace: "{{ event.payload.alerts[0].labels.namespace | default('ms-demo') }}"
+
+    - name: Derive deployment name from pod name
+      set_fact:
+        deployment_name: "{{ alert_pod | regex_replace('-[a-z0-9]+-[a-z0-9]+$', '') }}"
+
+    - name: Log remediation start
+      debug:
+        msg: "CrashLoopBackOff (exit 127) detected — pod={{ alert_pod }} deployment={{ deployment_name }}"
+
+    # ─────────────────────────────────────────────
+    # FIND PREVIOUS GOOD REPLICASET
+    # ─────────────────────────────────────────────
+
+    - name: Get all ReplicaSets for this deployment
+      kubernetes.core.k8s_info:
+        kind: ReplicaSet
+        namespace: "{{ alert_namespace }}"
+        label_selectors:
+          - "app={{ deployment_name }}"
+        validate_certs: false
+      register: all_rs
+
+    - name: Debug — show RS count and names
+      debug:
+        msg: "Total RS found: {{ all_rs.resources | length }} — names: {{ all_rs.resources | map(attribute='metadata.name') | list }}"
+
+    - name: Get current active image
+      set_fact:
+        current_image_live: >-
+          {{ (all_rs.resources
+             | selectattr('status.replicas', 'defined')
+             | selectattr('status.replicas', '>', 0)
+             | sort(attribute='metadata.creationTimestamp')
+             | last).spec.template.spec.containers[0].image }}
+
+    - name: Find previous good RS image (different image, zero replicas)
+      set_fact:
+        previous_image: >-
+          {{ all_rs.resources
+             | sort(attribute='metadata.creationTimestamp')
+             | reverse
+             | selectattr('status.replicas', 'defined')
+             | selectattr('status.replicas', 'equalto', 0)
+             | map(attribute='spec.template.spec.containers')
+             | map('first')
+             | selectattr('image', '!=', current_image_live)
+             | map(attribute='image')
+             | list
+             | first | default('') }}
+
+    - name: Evaluate whether a previous revision exists
+      set_fact:
+        has_previous_revision: "{{ previous_image | length > 0 }}"
+
+    - name: Log revision check
+      debug:
+        msg: "Previous image found: {{ has_previous_revision }} — current: {{ current_image_live }} — previous: {{ previous_image }}"
+
+    # ─────────────────────────────────────────────
+    # FAIL FAST IF NO PREVIOUS REVISION
+    # ─────────────────────────────────────────────
+
+    - name: Fail if no previous revision available
+      fail:
+        msg: >
+          No previous ReplicaSet found for deployment {{ deployment_name }}.
+          Cannot perform rollback. Manual intervention required.
+      when: not (has_previous_revision | bool)
+
+    # ─────────────────────────────────────────────
+    # ROLLBACK TO PREVIOUS REPLICASET IMAGE
+    # ─────────────────────────────────────────────
+
+    - name: Patch deployment to previous good image
+      kubernetes.core.k8s:
+        validate_certs: false
+        state: patched
+        kind: Deployment
+        name: "{{ deployment_name }}"
+        namespace: "{{ alert_namespace }}"
+        definition:
+          metadata:
+            annotations:
+              remediation/crashloop-rolled-back-at: "{{ ansible_date_time.iso8601 }}"
+          spec:
+            template:
+              spec:
+                containers:
+                  - name: server
+                    image: "{{ previous_image }}"
+      register: rollback_result
+
+    - name: Log rollback applied
+      debug:
+        msg: "Rolled back {{ deployment_name }} from {{ current_image_live }} to {{ previous_image }}"
+
+    # ─────────────────────────────────────────────
+    # WAIT FOR ROLLOUT TO COMPLETE
+    # ─────────────────────────────────────────────
+
+    - name: Wait for deployment rollout to complete
+      kubernetes.core.k8s_info:
+        kind: Deployment
+        name: "{{ deployment_name }}"
+        namespace: "{{ alert_namespace }}"
+        validate_certs: false
+      register: rollout_status
+      until: >-
+        rollout_status.resources[0].status.readyReplicas is defined and
+        rollout_status.resources[0].status.readyReplicas ==
+        rollout_status.resources[0].spec.replicas
+      retries: 18
+      delay: 10
+
+    - name: Get current image after remediation
+      set_fact:
+        current_image_after: >-
+          {{ rollout_status.resources[0].spec.template.spec.containers[0].image }}
+
+    # ─────────────────────────────────────────────
+    # EMAIL NOTIFICATION
+    # ─────────────────────────────────────────────
+
+    - name: Prepare email body
+      set_fact:
+        email_subject: "[RF-02] CrashLoopBackOff Remediated - {{ deployment_name }}"
+        email_body: |
+          RF-02 Autonomous Remediation Platform - Alert
+
+          Severity    - CRITICAL
+          Scenario    - S6 CrashLoopBackOff Bad Entrypoint
+          Time        - {{ ansible_date_time.iso8601 }}
+
+          Affected Service
+          Deployment  - {{ deployment_name }}
+          Pod         - {{ alert_pod }}
+          Namespace   - {{ alert_namespace }}
+
+          Detection
+          Cause       - Bad entrypoint / command not found (exit code 127)
+          Method      - Pod in CrashLoopBackOff with exit code 127 for 2 minutes.
+
+          Remediation Applied
+          Action               - Rollback to previous ReplicaSet image
+          Broken image         - {{ current_image_live }}
+          Image after rollback - {{ current_image_after }}
+          Status               - Rollout complete, service healthy.
+
+          Required Action
+          The deployed image had an invalid entrypoint or command override.
+          The rollback restored the last known good image.
+          Please fix the entrypoint configuration before redeploying.
+
+          This is an automated message from RF-02.
+          Do not reply to this email.
+
+    - name: Write email body to temp file
+      copy:
+        content: "{{ email_body }}"
+        dest: /tmp/rf02_email_body.txt
+      no_log: true
+
+    - name: Write email send script
+      copy:
+        dest: /tmp/rf02_send_email.py
+        content: |
+          import smtplib
+          from email.mime.text import MIMEText
+          body = open('/tmp/rf02_email_body.txt').read()
+          msg = MIMEText(body)
+          msg['Subject'] = '{{ email_subject }}'
+          msg['From'] = '{{ smtp_user }}'
+          msg['To'] = '{{ smtp_user }}'
+          s = smtplib.SMTP('smtp.gmail.com', 587)
+          s.starttls()
+          s.login('{{ smtp_user }}', '{{ smtp_password }}')
+          s.sendmail('{{ smtp_user }}', '{{ smtp_user }}', msg.as_string())
+          s.quit()
+          print('Email sent successfully')
+      no_log: true
+
+    - name: Send email notification
+      command: python3 /tmp/rf02_send_email.py
+
+    # ─────────────────────────────────────────────
+    # FINAL REPORT
+    # ─────────────────────────────────────────────
+
+    - name: Report remediation complete
+      debug:
+        msg: >
+          S6 remediation complete — deployment={{ deployment_name }}
+          | cause=bad entrypoint (exit 127)
+          | broken_image={{ current_image_live }}
+          | restored_image={{ current_image_after }}
+          | email sent to {{ smtp_user }}

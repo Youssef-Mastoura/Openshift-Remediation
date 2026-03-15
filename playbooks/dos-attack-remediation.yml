@@ -1,0 +1,288 @@
+---
+- name: S8 - DoS Attack Remediation
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars:
+    app_namespace: ms-demo
+
+  tasks:
+
+    # ─────────────────────────────────────────────
+    # EXTRACT ALERT INFO
+    # ─────────────────────────────────────────────
+
+    - name: Extract alert info from event
+      set_fact:
+        alert_route: "{{ event.payload.alerts[0].labels.route }}"
+        alert_namespace: "{{ event.payload.alerts[0].labels.namespace | default('ms-demo') }}"
+
+    - name: Log remediation start
+      debug:
+        msg: "DoS attack alert fired — route={{ alert_route }} namespace={{ alert_namespace }}"
+
+    # ─────────────────────────────────────────────
+    # DERIVE SERVICE NAME FROM ROUTE
+    # The route name in OpenShift matches the service/deployment name
+    # for Online Boutique (ms-demo). We use it directly.
+    # ─────────────────────────────────────────────
+
+    - name: Derive deployment name from route label
+      set_fact:
+        deployment_name: "{{ alert_route }}"
+
+    - name: Log derived deployment name
+      debug:
+        msg: "Derived deployment: {{ deployment_name }} from route: {{ alert_route }}"
+
+    # ─────────────────────────────────────────────
+    # VERIFY ROUTE EXISTS
+    # ─────────────────────────────────────────────
+
+    - name: Get route info
+      kubernetes.core.k8s_info:
+        kind: Route
+        name: "{{ alert_route }}"
+        namespace: "{{ alert_namespace }}"
+        validate_certs: false
+      register: route_info
+
+    - name: Fail if route not found
+      fail:
+        msg: "Route {{ alert_route }} not found in namespace {{ alert_namespace }}"
+      when: route_info.resources | length == 0
+
+    # ─────────────────────────────────────────────
+    # ACTION 1 — RATE LIMIT THE ROUTE
+    # Applies OpenShift native HAProxy rate limiting
+    # annotation directly on the Route object.
+    # No HAProxy config change. No router restart.
+    # Graceful — existing connections unaffected.
+    # ─────────────────────────────────────────────
+
+    - name: "[RateLimit] Apply rate limiting annotation on targeted route"
+      kubernetes.core.k8s:
+        state: present
+        validate_certs: false
+        definition:
+          apiVersion: route.openshift.io/v1
+          kind: Route
+          metadata:
+            name: "{{ alert_route }}"
+            namespace: "{{ alert_namespace }}"
+            annotations:
+              haproxy.router.openshift.io/rate-limit-connections: "true"
+              haproxy.router.openshift.io/rate-limit-connections.rate-http: "20"
+              remediation/dos-rate-limit-applied-at: "{{ ansible_date_time.iso8601 }}"
+
+    - name: "[RateLimit] Log rate limit applied"
+      debug:
+        msg: >
+          Rate limiting applied on route {{ alert_route }}
+          — max 20 HTTP req/s per client source IP
+
+    # ─────────────────────────────────────────────
+    # ACTION 2 — APPLY NETWORK POLICY
+    # Restricts ingress to the targeted pod so only:
+    #   - OpenShift router (external traffic)
+    #   - Pods within ms-demo (inter-service calls)
+    #   - OpenShift monitoring (Prometheus scraping)
+    # Any other source is blocked.
+    # Fully reversible — engineer deletes when done.
+    # ─────────────────────────────────────────────
+
+    - name: "[NetworkPolicy] Apply protective ingress policy on targeted deployment"
+      kubernetes.core.k8s:
+        state: present
+        validate_certs: false
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata:
+            name: "dos-mitigation-{{ deployment_name }}"
+            namespace: "{{ alert_namespace }}"
+            annotations:
+              remediation/dos-networkpolicy-applied-at: "{{ ansible_date_time.iso8601 }}"
+          spec:
+            podSelector:
+              matchLabels:
+                app: "{{ deployment_name }}"
+            policyTypes:
+              - Ingress
+            ingress:
+              # Allow traffic from OpenShift router (external users)
+              - from:
+                  - namespaceSelector:
+                      matchLabels:
+                        kubernetes.io/metadata.name: openshift-ingress
+              # Allow traffic from pods within ms-demo (inter-service calls)
+              - from:
+                  - podSelector: {}
+              # Allow traffic from Prometheus (monitoring namespace)
+              - from:
+                  - namespaceSelector:
+                      matchLabels:
+                        kubernetes.io/metadata.name: openshift-monitoring
+
+    - name: "[NetworkPolicy] Log network policy applied"
+      debug:
+        msg: >
+          NetworkPolicy dos-mitigation-{{ deployment_name }} applied
+          — ingress restricted to openshift-ingress, ms-demo pods, and openshift-monitoring
+
+    # ─────────────────────────────────────────────
+    # ACTION 3 — SCALE UP DEPLOYMENT
+    # Increases replicas by 1.5x to absorb legitimate
+    # traffic that gets through the rate limit.
+    # Same pattern as S1/S5/S6.
+    # ─────────────────────────────────────────────
+
+    - name: "[Scale] Get current deployment info"
+      kubernetes.core.k8s_info:
+        kind: Deployment
+        name: "{{ deployment_name }}"
+        namespace: "{{ alert_namespace }}"
+        validate_certs: false
+      register: deployment_info
+
+    - name: "[Scale] Extract current replica count"
+      set_fact:
+        current_replicas: "{{ deployment_info.resources[0].spec.replicas | int }}"
+
+    - name: "[Scale] Calculate new replica count (current × 1.5)"
+      set_fact:
+        new_replicas: "{{ (current_replicas | int * 1.5) | round(0, 'ceil') | int }}"
+
+    - name: "[Scale] Log replica change"
+      debug:
+        msg: "Scaling {{ deployment_name }}: {{ current_replicas }} → {{ new_replicas }} replicas"
+
+    - name: "[Scale] Scale up targeted deployment"
+      kubernetes.core.k8s_scale:
+        kind: Deployment
+        name: "{{ deployment_name }}"
+        namespace: "{{ alert_namespace }}"
+        replicas: "{{ new_replicas }}"
+        validate_certs: false
+
+    # ─────────────────────────────────────────────
+    # WAIT FOR SCALE UP
+    # ─────────────────────────────────────────────
+
+    - name: Wait for scaled deployment to become ready
+      kubernetes.core.k8s_info:
+        kind: Deployment
+        name: "{{ deployment_name }}"
+        namespace: "{{ alert_namespace }}"
+        validate_certs: false
+      register: scale_status
+      until: >-
+        scale_status.resources[0].status.readyReplicas is defined and
+        scale_status.resources[0].status.readyReplicas | int >= new_replicas | int
+      retries: 12
+      delay: 10
+
+    # ─────────────────────────────────────────────
+    # ACTION 4 — EMAIL NOTIFICATION
+    # ─────────────────────────────────────────────
+
+    - name: "[Email] Prepare email body"
+      set_fact:
+        email_subject: "[RF-02] DoS Attack Detected and Mitigated - {{ alert_route }}"
+        email_body: |
+          RF-02 Autonomous Remediation Platform - Security Alert
+
+          Severity    - CRITICAL
+          Scenario    - S8 DoS Attack Detection and Mitigation
+          Time        - {{ ansible_date_time.iso8601 }}
+
+          Attack Details
+          Route       - {{ alert_route }}
+          Namespace   - {{ alert_namespace }}
+          Detection   - HTTP response rate exceeded 50 req/s threshold
+                        (normal baseline is approx 1.4 req/s)
+
+          Automated Actions Taken
+
+          1. Rate Limiting Applied
+             Route {{ alert_route }} is now limited to 20 HTTP requests
+             per second per client source IP at the OpenShift ingress
+             router level. Excess requests are dropped silently.
+             Legitimate users (1-5 req/s) are completely unaffected.
+
+          2. Network Policy Applied
+             NetworkPolicy dos-mitigation-{{ deployment_name }} created.
+             Ingress to {{ deployment_name }} pods is now restricted to:
+             - OpenShift ingress router (external traffic)
+             - Pods within ms-demo namespace (inter-service calls)
+             - OpenShift monitoring namespace (Prometheus scraping)
+             All other sources are blocked.
+
+          3. Deployment Scaled Up
+             {{ deployment_name }} scaled from {{ current_replicas }}
+             to {{ new_replicas }} replicas to maintain availability
+             for legitimate traffic during the attack.
+
+          Required Manual Actions (when attack is resolved)
+          The following resources remain active and must be cleaned
+          up by the engineer once the attack is confirmed resolved:
+
+          Remove rate limiting:
+            oc annotate route {{ alert_route }} -n {{ alert_namespace }} \
+              haproxy.router.openshift.io/rate-limit-connections- \
+              haproxy.router.openshift.io/rate-limit-connections.rate-http-
+
+          Remove network policy:
+            oc delete networkpolicy dos-mitigation-{{ deployment_name }} \
+              -n {{ alert_namespace }}
+
+          Scale back to original:
+            oc scale deployment {{ deployment_name }} \
+              -n {{ alert_namespace }} --replicas={{ current_replicas }}
+
+          This is an automated message from RF-02.
+          Do not reply to this email.
+
+    - name: "[Email] Write email body to temp file"
+      copy:
+        content: "{{ email_body }}"
+        dest: /tmp/rf02_dos_email_body.txt
+      no_log: true
+
+    - name: "[Email] Write email send script"
+      copy:
+        dest: /tmp/rf02_dos_send_email.py
+        content: |
+          import smtplib
+          from email.mime.text import MIMEText
+          body = open('/tmp/rf02_dos_email_body.txt').read()
+          msg = MIMEText(body)
+          msg['Subject'] = '{{ email_subject }}'
+          msg['From'] = '{{ smtp_user }}'
+          msg['To'] = '{{ smtp_user }}'
+          s = smtplib.SMTP('smtp.gmail.com', 587)
+          s.starttls()
+          s.login('{{ smtp_user }}', '{{ smtp_password }}')
+          s.sendmail('{{ smtp_user }}', '{{ smtp_user }}', msg.as_string())
+          s.quit()
+          print('Email sent successfully')
+      no_log: true
+
+    - name: "[Email] Send DoS attack notification"
+      command: python3 /tmp/rf02_dos_send_email.py
+
+    # ─────────────────────────────────────────────
+    # FINAL REPORT
+    # ─────────────────────────────────────────────
+
+    - name: Report remediation complete
+      debug:
+        msg: >
+          S8 DoS remediation complete
+          | route={{ alert_route }}
+          | deployment={{ deployment_name }}
+          | rate_limit=20req/s applied
+          | networkpolicy=dos-mitigation-{{ deployment_name }} applied
+          | replicas={{ current_replicas }} → {{ new_replicas }}
+          | email sent to {{ smtp_user }}
+          | manual cleanup required by engineer

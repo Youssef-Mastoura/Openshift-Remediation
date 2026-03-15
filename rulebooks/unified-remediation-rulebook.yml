@@ -102,3 +102,13 @@
           job_args:
             extra_vars:
               event: "{{ event }}"
+
+    - name: Trigger DoS Attack Fix
+      condition: event.payload.alerts is selectattr("labels.remediation", "==", "dos-attack")
+      action:
+        run_job_template:
+          name: "dos-attack-remediation"
+          organization: "Default"
+          job_args:
+            extra_vars:
+              event: "{{ event }}"

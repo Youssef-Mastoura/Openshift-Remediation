@@ -21,9 +21,13 @@
       set_fact:
         deployment_name: "{{ alert_pod | regex_replace('-[a-z0-9]+-[a-z0-9]+$', '') }}"
 
+    - name: Derive crashlooping RS name from pod name (strip pod suffix only)
+      set_fact:
+        bad_rs_name: "{{ alert_pod | regex_replace('-[a-z0-9]+$', '') }}"
+
     - name: Log remediation start
       debug:
-        msg: "CrashLoopBackOff (exit 127) detected — pod={{ alert_pod }} deployment={{ deployment_name }}"
+        msg: "CrashLoopBackOff (exit 127) detected — pod={{ alert_pod }} deployment={{ deployment_name }} bad_rs={{ bad_rs_name }}"
 
     # ─────────────────────────────────────────────
     # GET CURRENT CONTAINER STATE FOR EMAIL DETAIL
@@ -72,7 +76,7 @@
           restarts={{ restart_count }} command={{ current_command }}
 
     # ─────────────────────────────────────────────
-    # FIND PREVIOUS GOOD REPLICASET
+    # FIND HEALTHY RUNNING REPLICASET
     # ─────────────────────────────────────────────
 
     - name: Get all ReplicaSets for this deployment
@@ -88,45 +92,44 @@
       debug:
         msg: "Total RS found: {{ all_rs.resources | length }} — names: {{ all_rs.resources | map(attribute='metadata.name') | list }}"
 
-    - name: Find most recent previous RS with zero replicas
+    - name: Find healthy RS (replicas > 0, not the crashlooping one)
       set_fact:
-        previous_rs: >-
+        healthy_rs: >-
           {{ all_rs.resources
-             | sort(attribute='metadata.creationTimestamp')
-             | reverse
              | selectattr('status.replicas', 'defined')
-             | selectattr('status.replicas', 'equalto', 0)
-             | list
-             | first | default({}) }}
+             | selectattr('status.replicas', '>', 0)
+             | rejectattr('metadata.name', 'equalto', bad_rs_name)
+             | sort(attribute='metadata.creationTimestamp')
+             | last | default({}) }}
 
-    - name: Extract previous RS image and command
+    - name: Extract healthy RS image and command
       set_fact:
-        previous_image: "{{ previous_rs.spec.template.spec.containers[0].image | default('') }}"
-        previous_command: "{{ previous_rs.spec.template.spec.containers[0].command | default([]) }}"
-      when: previous_rs | length > 0
+        previous_image: "{{ healthy_rs.spec.template.spec.containers[0].image | default('') }}"
+        previous_command: "{{ healthy_rs.spec.template.spec.containers[0].command | default([]) }}"
+      when: healthy_rs | length > 0
 
-    - name: Set empty values if no previous RS
+    - name: Set empty values if no healthy RS found
       set_fact:
         previous_image: ""
         previous_command: []
-      when: previous_rs | length == 0
+      when: healthy_rs | length == 0
 
-    - name: Evaluate whether a previous revision exists
+    - name: Evaluate whether a healthy RS exists
       set_fact:
-        has_previous_revision: "{{ previous_rs | length > 0 and previous_image | length > 0 }}"
+        has_previous_revision: "{{ healthy_rs | length > 0 and previous_image | length > 0 }}"
 
-    - name: Log revision check
+    - name: Log healthy RS check
       debug:
         msg: >
-          Previous RS found: {{ has_previous_revision }}
-          — previous_image={{ previous_image }}
-          — previous_command={{ previous_command }}
+          Healthy RS found: {{ has_previous_revision }}
+          — image={{ previous_image }}
+          — command={{ previous_command }}
 
     # ─────────────────────────────────────────────
-    # PATH A — ROLLBACK (previous RS exists)
+    # PATH A — ROLLBACK (healthy RS exists)
     # ─────────────────────────────────────────────
 
-    - name: "[Rollback] Patch deployment to previous RS image and command"
+    - name: "[Rollback] Patch deployment to healthy RS image and command"
       kubernetes.core.k8s:
         validate_certs: false
         state: patched
@@ -203,7 +206,7 @@
           Restart count    - {{ restart_count }}
 
           Remediation Applied
-          Action           - Automatic rollback to previous ReplicaSet
+          Action           - Automatic rollback to last healthy ReplicaSet
           Restored image   - {{ previous_image }}
           Restored command - {{ previous_command if previous_command | length > 0 else 'none (default entrypoint)' }}
           Status           - Rollout complete, service is healthy.
@@ -249,7 +252,7 @@
       when: has_previous_revision | bool
 
     # ─────────────────────────────────────────────
-    # EMAIL — PATH B (no previous RS, manual action required)
+    # EMAIL — PATH B (no healthy RS, manual action required)
     # ─────────────────────────────────────────────
 
     - name: "[Email-B] Prepare manual intervention email"
@@ -273,7 +276,7 @@
           This means the command specified in the deployment spec does
           not exist inside the container image filesystem.
           The platform could NOT perform an automatic rollback because
-          no previous ReplicaSet exists for this deployment.
+          no healthy running ReplicaSet exists for this deployment.
 
           Diagnostic Details
           Container        - {{ container_name }}

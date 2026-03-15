@@ -97,3 +97,13 @@
           job_args:
             extra_vars:
               event: "{{ event }}"
+              
+    - name: Handle CrashLoopBackOff Bad Entrypoint
+      condition: event.payload.alerts | selectattr('labels.remediation', 'equalto', 'crashloop-bad-entrypoint') | list | length > 0
+      action:
+        run_job_template:
+          name: crashloop-remediation
+          organization: Default
+          job_args:
+            extra_vars:
+              event: "{{ event }}"

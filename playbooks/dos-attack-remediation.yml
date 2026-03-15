@@ -8,48 +8,56 @@
 
     # ─────────────────────────────────────────────
     # EXTRACT ALERT INFO
-    # The alert fires from openshift-ingress namespace
-    # but all remediation targets ms-demo namespace.
+    # Alert fires from ms-demo namespace.
+    # Pod name and namespace come from alert labels.
+    # Deployment name derived from pod name.
+    # Route found dynamically from deployment name.
     # ─────────────────────────────────────────────
 
     - name: Extract alert info from event
       set_fact:
-        alert_route: "{{ event.payload.alerts[0].labels.route }}"
-        app_namespace: "ms-demo"
+        alert_pod: "{{ event.payload.alerts[0].labels.pod }}"
+        app_namespace: "{{ event.payload.alerts[0].labels.namespace | default('ms-demo') }}"
+
+    - name: Derive deployment name from pod name
+      set_fact:
+        deployment_name: "{{ alert_pod | regex_replace('-[a-z0-9]+-[a-z0-9]+$', '') }}"
 
     - name: Log remediation start
       debug:
-        msg: "DoS attack alert fired — route={{ alert_route }}"
+        msg: "DoS attack alert fired — pod={{ alert_pod }} deployment={{ deployment_name }}"
 
     # ─────────────────────────────────────────────
-    # FIND ROUTE IN ms-demo AND DERIVE SERVICE NAME
-    # Read spec.to.name from route to get backend
-    # service name dynamically — no hardcoding.
+    # FIND ROUTE DYNAMICALLY
+    # Scan all routes in ms-demo and find the one
+    # whose backend service matches deployment name.
+    # If no route exists (internal service), skip
+    # rate limiting gracefully.
     # ─────────────────────────────────────────────
 
-    - name: Get route from ms-demo namespace
+    - name: Get all routes in ms-demo
       kubernetes.core.k8s_info:
         kind: Route
-        name: "{{ alert_route }}"
         namespace: "{{ app_namespace }}"
         validate_certs: false
-      register: route_info
+      register: all_routes
 
-    - name: Fail if route not found in ms-demo
-      fail:
-        msg: "Route {{ alert_route }} not found in namespace {{ app_namespace }}"
-      when: route_info.resources | length == 0
-
-    - name: Extract deployment name from route backend service
+    - name: Find matching route for this deployment
       set_fact:
-        deployment_name: "{{ route_info.resources[0].spec.to.name }}"
+        alert_route: >-
+          {{ all_routes.resources
+             | selectattr('spec.to.name', '==', deployment_name)
+             | map(attribute='metadata.name')
+             | list | first | default('') }}
 
-    - name: Log derived deployment name
+    - name: Log derived route
       debug:
-        msg: "Route={{ alert_route }} → backend service/deployment={{ deployment_name }}"
+        msg: "deployment={{ deployment_name }} → route={{ alert_route if alert_route else 'none (internal service)' }}"
 
     # ─────────────────────────────────────────────
     # ACTION 1 — RATE LIMIT THE ROUTE
+    # Only applied if a route exists for this deployment.
+    # Skipped gracefully for internal services.
     # ─────────────────────────────────────────────
 
     - name: "[RateLimit] Apply rate limiting annotation on targeted route"
@@ -66,10 +74,17 @@
               haproxy.router.openshift.io/rate-limit-connections: "true"
               haproxy.router.openshift.io/rate-limit-connections.rate-http: "20"
               remediation/dos-rate-limit-applied-at: "{{ ansible_date_time.iso8601 }}"
+      when: alert_route | length > 0
 
     - name: "[RateLimit] Log rate limit applied"
       debug:
         msg: "Rate limiting applied on route {{ alert_route }} — max 20 HTTP req/s per client"
+      when: alert_route | length > 0
+
+    - name: "[RateLimit] Log no route found"
+      debug:
+        msg: "No route found for {{ deployment_name }} — rate limiting skipped (internal service)"
+      when: alert_route | length == 0
 
     # ─────────────────────────────────────────────
     # ACTION 2 — APPLY NETWORK POLICY
@@ -160,7 +175,7 @@
 
     - name: "[Email] Prepare email body"
       set_fact:
-        email_subject: "[RF-02] DoS Attack Detected and Mitigated - {{ alert_route }}"
+        email_subject: "[RF-02] DoS Attack Detected and Mitigated - {{ deployment_name }}"
         email_body: |
           RF-02 Autonomous Remediation Platform - Security Alert
 
@@ -169,17 +184,21 @@
           Time        - {{ ansible_date_time.iso8601 }}
 
           Attack Details
-          Route           - {{ alert_route }}
-          Backend Service - {{ deployment_name }}
+          Pod             - {{ alert_pod }}
+          Deployment      - {{ deployment_name }}
           Namespace       - {{ app_namespace }}
-          Detection       - HTTP response rate exceeded 50 req/s threshold
+          Route           - {{ alert_route if alert_route else 'N/A (internal service)' }}
+          Detection       - Network receive rate exceeded 50 KB/s threshold
 
           Automated Actions Taken
 
           1. Rate Limiting Applied
+             {% if alert_route %}
              Route {{ alert_route }} limited to 20 HTTP req/s per client
              at the OpenShift ingress router level.
-             Legitimate users are completely unaffected.
+             {% else %}
+             Skipped — no route exists for this service.
+             {% endif %}
 
           2. Network Policy Applied
              NetworkPolicy dos-mitigation-{{ deployment_name }} created.
@@ -194,10 +213,12 @@
 
           Manual Cleanup Required (when attack is resolved)
 
+          {% if alert_route %}
           Remove rate limiting:
             oc annotate route {{ alert_route }} -n {{ app_namespace }} \
               haproxy.router.openshift.io/rate-limit-connections- \
               haproxy.router.openshift.io/rate-limit-connections.rate-http-
+          {% endif %}
 
           Remove network policy:
             oc delete networkpolicy dos-mitigation-{{ deployment_name }} \
@@ -242,9 +263,9 @@
       debug:
         msg: >
           S8 DoS remediation complete
-          | route={{ alert_route }}
+          | pod={{ alert_pod }}
           | deployment={{ deployment_name }}
-          | rate_limit=20req/s applied
+          | route={{ alert_route if alert_route else 'none' }}
           | networkpolicy=dos-mitigation-{{ deployment_name }} applied
           | replicas={{ current_replicas }} → {{ new_replicas }}
           | email sent to {{ smtp_user }}

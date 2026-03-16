@@ -1,7 +1,7 @@
 ---
 - name: TLS Certificate Rotation
   hosts: bastion
-  gather_facts: false
+  gather_facts: true
 
   vars:
     work_dir: "/tmp/tls-rotation-{{ ansible_date_time.epoch }}"
@@ -10,10 +10,10 @@
 
     - name: Extract alert labels
       set_fact:
-        secret_name: "{{ event.alert.labels.secret_name }}"
-        secret_namespace: "{{ event.alert.labels.secret_namespace }}"
-        cert_cn: "{{ event.alert.labels.subject_CN }}"
-        cert_org: "{{ event.alert.labels.issuer_O }}"
+        secret_name: "{{ event['payload']['alerts'][0]['labels']['secret_name'] }}"
+        secret_namespace: "{{ event['payload']['alerts'][0]['labels']['secret_namespace'] }}"
+        cert_cn: "{{ event['payload']['alerts'][0]['labels']['subject_CN'] }}"
+        cert_org: "{{ event['payload']['alerts'][0]['labels']['issuer_O'] }}"
 
     - name: Show what we are rotating
       debug:
@@ -75,7 +75,7 @@
         cert_content: "{{ secret_info.resources[0].data['tls.crt'] | b64decode }}"
         key_content: "{{ secret_info.resources[0].data['tls.key'] | b64decode }}"
 
-    - name: Find the route using this secret in the namespace
+    - name: Find all routes in the namespace
       k8s_info:
         api_version: route.openshift.io/v1
         kind: Route

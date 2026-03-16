@@ -112,3 +112,13 @@
           job_args:
             extra_vars:
               event: "{{ event }}"
+
+    - name: Handle TLS Certificate Expiry
+      condition: event.alert.labels.alertname == "TLSCertExpiringSoon"
+      action:
+        run_job_template:
+          name: tls-cert-rotation
+          organization: Default
+          job_args:
+            extra_vars:
+              event: "{{ event }}"

@@ -1,29 +1,34 @@
 ---
 - name: TLS Certificate Rotation
-  hosts: bastion
+  hosts: localhost
+  connection: local
   gather_facts: true
-
   vars:
-    work_dir: "/tmp/tls-rotation-{{ ansible_date_time.epoch }}"
+    app_namespace: ms-demo
 
   tasks:
 
     - name: Extract alert labels
       set_fact:
-        secret_name: "{{ event['payload']['alerts'][0]['labels']['secret_name'] }}"
-        secret_namespace: "{{ event['payload']['alerts'][0]['labels']['secret_namespace'] }}"
-        cert_cn: "{{ event['payload']['alerts'][0]['labels']['subject_CN'] }}"
-        cert_org: "{{ event['payload']['alerts'][0]['labels']['issuer_O'] }}"
+        secret_name: "{{ event.payload.alerts[0].labels.secret_name }}"
+        secret_namespace: "{{ event.payload.alerts[0].labels.secret_namespace }}"
+        cert_cn: "{{ event.payload.alerts[0].labels.subject_CN }}"
+        cert_org: "{{ event.payload.alerts[0].labels.issuer_O }}"
 
-    - name: Show what we are rotating
+    - name: Log remediation start
       debug:
-        msg: "Rotating cert for secret {{ secret_name }} in {{ secret_namespace }} — CN: {{ cert_cn }}"
+        msg: "TLS cert expiry alert fired — secret={{ secret_name }} namespace={{ secret_namespace }} CN={{ cert_cn }}"
 
     - name: Create working directory
       file:
-        path: "{{ work_dir }}"
+        path: "/tmp/tls-rotation-{{ ansible_date_time.epoch }}"
         state: directory
         mode: '0700'
+      register: work_dir_info
+
+    - name: Set work_dir fact
+      set_fact:
+        work_dir: "/tmp/tls-rotation-{{ ansible_date_time.epoch }}"
 
     - name: Generate new private key
       command: >
@@ -49,25 +54,29 @@
       register: new_key
 
     - name: Update Kubernetes Secret with new cert
-      k8s:
+      kubernetes.core.k8s:
         state: present
+        validate_certs: false
         definition:
           apiVersion: v1
           kind: Secret
           metadata:
             name: "{{ secret_name }}"
             namespace: "{{ secret_namespace }}"
+            annotations:
+              remediation/cert-rotated-at: "{{ ansible_date_time.iso8601 }}"
           type: kubernetes.io/tls
           data:
             tls.crt: "{{ new_cert.content }}"
             tls.key: "{{ new_key.content }}"
 
-    - name: Read updated secret to get cert content for route patch
-      k8s_info:
+    - name: Read updated secret to decode cert and key
+      kubernetes.core.k8s_info:
         api_version: v1
         kind: Secret
         name: "{{ secret_name }}"
         namespace: "{{ secret_namespace }}"
+        validate_certs: false
       register: secret_info
 
     - name: Decode cert and key from secret
@@ -76,25 +85,37 @@
         key_content: "{{ secret_info.resources[0].data['tls.key'] | b64decode }}"
 
     - name: Find all routes in the namespace
-      k8s_info:
+      kubernetes.core.k8s_info:
         api_version: route.openshift.io/v1
         kind: Route
         namespace: "{{ secret_namespace }}"
+        validate_certs: false
       register: all_routes
 
     - name: Identify the target route (edge terminated)
       set_fact:
-        target_route: "{{ all_routes.resources | selectattr('spec.tls.termination', 'defined') | selectattr('spec.tls.termination', 'equalto', 'edge') | list | first }}"
+        target_route: >-
+          {{ all_routes.resources
+             | selectattr('spec.tls.termination', 'defined')
+             | selectattr('spec.tls.termination', 'equalto', 'edge')
+             | list | first }}
+
+    - name: Log target route found
+      debug:
+        msg: "Patching route {{ target_route.metadata.name }} with new certificate"
 
     - name: Patch route with new certificate
-      k8s:
+      kubernetes.core.k8s:
         state: present
+        validate_certs: false
         definition:
           apiVersion: route.openshift.io/v1
           kind: Route
           metadata:
             name: "{{ target_route.metadata.name }}"
             namespace: "{{ secret_namespace }}"
+            annotations:
+              remediation/cert-rotated-at: "{{ ansible_date_time.iso8601 }}"
           spec:
             tls:
               termination: edge
@@ -106,12 +127,16 @@
         path: "{{ work_dir }}"
         state: absent
 
+    - name: Log remediation complete
+      debug:
+        msg: "TLS cert rotation complete — secret={{ secret_name }} route={{ target_route.metadata.name }} new expiry: 365 days"
+
     - name: Send email notification
       shell: >
         python3 -c "
         import smtplib
         from email.mime.text import MIMEText
-        msg = MIMEText('TLS certificate rotation completed.\n\nSecret: {{ secret_name }}\nNamespace: {{ secret_namespace }}\nCN: {{ cert_cn }}\nNew expiry: 365 days from now.')
+        msg = MIMEText('TLS certificate rotation completed.\n\nSecret: {{ secret_name }}\nNamespace: {{ secret_namespace }}\nCN: {{ cert_cn }}\nRoute: {{ target_route.metadata.name }}\nNew expiry: 365 days from now.')
         msg[\"Subject\"] = \"[RF-02] TLS Cert Rotated — {{ secret_name }}\"
         msg[\"From\"] = \"rf02@linsoft.tn\"
         msg[\"To\"] = \"admin@linsoft.tn\"

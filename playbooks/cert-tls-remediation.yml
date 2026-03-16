@@ -1,0 +1,122 @@
+---
+- name: TLS Certificate Rotation
+  hosts: bastion
+  gather_facts: false
+
+  vars:
+    work_dir: "/tmp/tls-rotation-{{ ansible_date_time.epoch }}"
+
+  tasks:
+
+    - name: Extract alert labels
+      set_fact:
+        secret_name: "{{ event.alert.labels.secret_name }}"
+        secret_namespace: "{{ event.alert.labels.secret_namespace }}"
+        cert_cn: "{{ event.alert.labels.subject_CN }}"
+        cert_org: "{{ event.alert.labels.issuer_O }}"
+
+    - name: Show what we are rotating
+      debug:
+        msg: "Rotating cert for secret {{ secret_name }} in {{ secret_namespace }} — CN: {{ cert_cn }}"
+
+    - name: Create working directory
+      file:
+        path: "{{ work_dir }}"
+        state: directory
+        mode: '0700'
+
+    - name: Generate new private key
+      command: >
+        openssl genrsa -out {{ work_dir }}/tls.key 2048
+
+    - name: Generate new self-signed certificate (365 days)
+      command: >
+        openssl req -x509 -new
+        -key {{ work_dir }}/tls.key
+        -out {{ work_dir }}/tls.crt
+        -days 365
+        -nodes
+        -subj "/CN={{ cert_cn }}/O={{ cert_org }}"
+
+    - name: Read new certificate
+      slurp:
+        src: "{{ work_dir }}/tls.crt"
+      register: new_cert
+
+    - name: Read new private key
+      slurp:
+        src: "{{ work_dir }}/tls.key"
+      register: new_key
+
+    - name: Update Kubernetes Secret with new cert
+      k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ secret_name }}"
+            namespace: "{{ secret_namespace }}"
+          type: kubernetes.io/tls
+          data:
+            tls.crt: "{{ new_cert.content }}"
+            tls.key: "{{ new_key.content }}"
+
+    - name: Read updated secret to get cert content for route patch
+      k8s_info:
+        api_version: v1
+        kind: Secret
+        name: "{{ secret_name }}"
+        namespace: "{{ secret_namespace }}"
+      register: secret_info
+
+    - name: Decode cert and key from secret
+      set_fact:
+        cert_content: "{{ secret_info.resources[0].data['tls.crt'] | b64decode }}"
+        key_content: "{{ secret_info.resources[0].data['tls.key'] | b64decode }}"
+
+    - name: Find the route using this secret in the namespace
+      k8s_info:
+        api_version: route.openshift.io/v1
+        kind: Route
+        namespace: "{{ secret_namespace }}"
+      register: all_routes
+
+    - name: Identify the target route (edge terminated)
+      set_fact:
+        target_route: "{{ all_routes.resources | selectattr('spec.tls.termination', 'defined') | selectattr('spec.tls.termination', 'equalto', 'edge') | list | first }}"
+
+    - name: Patch route with new certificate
+      k8s:
+        state: present
+        definition:
+          apiVersion: route.openshift.io/v1
+          kind: Route
+          metadata:
+            name: "{{ target_route.metadata.name }}"
+            namespace: "{{ secret_namespace }}"
+          spec:
+            tls:
+              termination: edge
+              certificate: "{{ cert_content }}"
+              key: "{{ key_content }}"
+
+    - name: Clean up working directory
+      file:
+        path: "{{ work_dir }}"
+        state: absent
+
+    - name: Send email notification
+      shell: >
+        python3 -c "
+        import smtplib
+        from email.mime.text import MIMEText
+        msg = MIMEText('TLS certificate rotation completed.\n\nSecret: {{ secret_name }}\nNamespace: {{ secret_namespace }}\nCN: {{ cert_cn }}\nNew expiry: 365 days from now.')
+        msg[\"Subject\"] = \"[RF-02] TLS Cert Rotated — {{ secret_name }}\"
+        msg[\"From\"] = \"rf02@linsoft.tn\"
+        msg[\"To\"] = \"admin@linsoft.tn\"
+        s = smtplib.SMTP(\"localhost\", 25)
+        s.send_message(msg)
+        s.quit()
+        "
+      ignore_errors: true

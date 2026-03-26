@@ -1,0 +1,111 @@
+---
+- name: Remediate Faulty Readiness Probe
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars:
+    app_namespace: ms-demo
+
+  tasks:
+
+    - name: Extract alert labels
+      set_fact:
+        pod_name: "{{ event.payload.alerts[0].labels.pod_name }}"
+        namespace: "{{ event.payload.alerts[0].labels.namespace }}"
+
+    - name: Log remediation start
+      debug:
+        msg: "Remediation started for pod {{ pod_name }} in namespace {{ namespace }}"
+
+    - name: Create working directory
+      file:
+        path: "/tmp/remediation-{{ ansible_date_time.epoch }}"
+        state: directory
+        mode: '0700'
+      register: work_dir_info
+
+    - name: Set work_dir fact
+      set_fact:
+        work_dir: "/tmp/remediation-{{ ansible_date_time.epoch }}"
+
+    - name: Derive deployment name from pod name
+      set_fact:
+        deployment_name: "{{ pod_name | regex_replace('-[a-z0-9]+-[a-z0-9]+$', '') }}"
+
+    - name: Get current deployment replicas
+      kubernetes.core.k8s_info:
+        api_version: apps/v1
+        kind: Deployment
+        name: "{{ deployment_name }}"
+        namespace: "{{ namespace }}"
+        validate_certs: false
+      register: deployment_info
+
+    - name: Set current replicas fact
+      set_fact:
+        current_replicas: "{{ deployment_info.resources[0].spec.replicas }}"
+
+    - name: Scale down deployment to 0 replicas
+      kubernetes.core.k8s_scale:
+        api_version: apps/v1
+        kind: Deployment
+        name: "{{ deployment_name }}"
+        namespace: "{{ namespace }}"
+        replicas: 0
+        validate_certs: false
+
+    - name: Patch deployment with updated readiness probe
+      kubernetes.core.k8s:
+        state: present
+        validate_certs: false
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: "{{ deployment_name }}"
+            namespace: "{{ namespace }}"
+          spec:
+            template:
+              spec:
+                containers:
+                - name: currencyservice
+                  readinessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 10
+                    periodSeconds: 10
+
+    - name: Scale up deployment to increased replicas
+      kubernetes.core.k8s_scale:
+        api_version: apps/v1
+        kind: Deployment
+        name: "{{ deployment_name }}"
+        namespace: "{{ namespace }}"
+        replicas: "{{ current_replicas * 1.5 | int }}"
+        validate_certs: false
+
+    - name: Clean up working directory
+      file:
+        path: "{{ work_dir }}"
+        state: absent
+
+    - name: Log remediation complete
+      debug:
+        msg: "Remediation complete for pod {{ pod_name }} in namespace {{ namespace }}"
+
+    - name: Send email notification
+      shell: >
+        python3 -c "
+        import smtplib
+        from email.mime.text import MIMEText
+        msg = MIMEText('Remediation completed for pod {{ pod_name }} in namespace {{ namespace }}.')
+        msg[\"Subject\"] = \"[RF-01] Remediation Completed — {{ pod_name }}\"
+        msg[\"From\"] = \"rf01@linsoft.tn\"
+        msg[\"To\"] = \"admin@linsoft.tn\"
+        s = smtplib.SMTP(\"localhost\", 25)
+        s.send_message(msg)
+        s.quit()
+        "
+      ignore_errors: true
+      no_log: true

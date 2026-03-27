@@ -1,0 +1,325 @@
+---
+- name: S6 - Readiness Probe Failure Remediation
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars:
+    app_namespace: ms-demo
+
+  tasks:
+
+    - name: Extract pod and namespace from alert
+      set_fact:
+        pod_name: "{{ event_data.pod }}"
+        namespace: "{{ event_data.namespace | default('ms-demo') }}"
+
+    - name: Derive deployment name from pod name
+      set_fact:
+        deployment_name: "{{ pod_name | regex_replace('-[a-z0-9]+-[a-z0-9]+$', '') }}"
+
+    - name: Log remediation start
+      debug:
+        msg: "Readiness probe failure detected — pod={{ pod_name }} deployment={{ deployment_name }}"
+
+    # ─────────────────────────────────────────────
+    # CHECK PREVIOUS REPLICASETS
+    # ─────────────────────────────────────────────
+
+    - name: Get all ReplicaSets for this deployment
+      kubernetes.core.k8s_info:
+        kind: ReplicaSet
+        namespace: "{{ namespace }}"
+        label_selectors:
+          - "app={{ deployment_name }}"
+        validate_certs: false
+      register: all_rs
+
+    - name: Debug — show RS count and names
+      debug:
+        msg: "Total RS found: {{ all_rs.resources | length }} — names: {{ all_rs.resources | map(attribute='metadata.name') | list }}"
+
+    - name: Get current active image
+      set_fact:
+        current_image_live: >-
+          {{ (all_rs.resources
+             | selectattr('status.replicas', 'defined')
+             | selectattr('status.replicas', '>', 0)
+             | sort(attribute='metadata.creationTimestamp')
+             | last).spec.template.spec.containers[0].image }}
+
+    - name: Find previous good RS image
+      set_fact:
+        previous_image: >-
+          {{ all_rs.resources
+             | sort(attribute='metadata.creationTimestamp')
+             | reverse
+             | selectattr('status.replicas', 'defined')
+             | selectattr('status.replicas', 'equalto', 0)
+             | map(attribute='spec.template.spec.containers')
+             | map('first')
+             | selectattr('image', '!=', current_image_live)
+             | map(attribute='image')
+             | list
+             | first | default('') }}
+
+    - name: Check if a previous revision exists
+      set_fact:
+        has_previous_revision: "{{ previous_image | length > 0 }}"
+
+    - name: Log revision check result
+      debug:
+        msg: "Previous image found: {{ has_previous_revision }} — current: {{ current_image_live }} — previous: {{ previous_image }}"
+
+    # ─────────────────────────────────────────────
+    # PATH A — Rollback (previous image exists)
+    # ─────────────────────────────────────────────
+
+    - name: "[Rollback] Patch deployment to previous image"
+      kubernetes.core.k8s:
+        validate_certs: false
+        state: patched
+        kind: Deployment
+        name: "{{ deployment_name }}"
+        namespace: "{{ namespace }}"
+        definition:
+          metadata:
+            annotations:
+              remediation/readiness-probe-rollback-at: "{{ ansible_date_time.iso8601 }}"
+          spec:
+            template:
+              spec:
+                containers:
+                  - name: server
+                    image: "{{ previous_image }}"
+      when: has_previous_revision | bool
+      register: rollback_result
+
+    - name: "[Rollback] Log rollback result"
+      debug:
+        msg: "Rolled back {{ deployment_name }} from {{ current_image_live }} to {{ previous_image }}"
+      when: has_previous_revision | bool
+
+    # ─────────────────────────────────────────────
+    # PATH B — Restart (no previous image)
+    # ─────────────────────────────────────────────
+
+    - name: "[Restart] No previous image — performing rolling restart"
+      kubernetes.core.k8s:
+        validate_certs: false
+        state: patched
+        kind: Deployment
+        name: "{{ deployment_name }}"
+        namespace: "{{ namespace }}"
+        definition:
+          spec:
+            template:
+              metadata:
+                annotations:
+                  kubectl.kubernetes.io/restartedAt: "{{ ansible_date_time.iso8601 }}"
+                  remediation/readiness-probe-restart-at: "{{ ansible_date_time.iso8601 }}"
+      when: not (has_previous_revision | bool)
+
+    - name: "[Restart] Log restart applied"
+      debug:
+        msg: "No previous image found for {{ deployment_name }} — rolling restart applied as fallback"
+      when: not (has_previous_revision | bool)
+
+    # ─────────────────────────────────────────────
+    # WAIT FOR ROLLOUT
+    # ─────────────────────────────────────────────
+
+    - name: Wait for deployment rollout to complete
+      kubernetes.core.k8s_info:
+        kind: Deployment
+        name: "{{ deployment_name }}"
+        namespace: "{{ namespace }}"
+        validate_certs: false
+      register: rollout_status
+      until: >-
+        rollout_status.resources[0].status.readyReplicas is defined and
+        rollout_status.resources[0].status.readyReplicas ==
+        rollout_status.resources[0].spec.replicas
+      retries: 18
+      delay: 10
+
+    # ─────────────────────────────────────────────
+    # GET CURRENT IMAGE AFTER ACTION
+    # ─────────────────────────────────────────────
+
+    - name: Get current image after remediation
+      set_fact:
+        current_image: >-
+          {{ rollout_status.resources[0].spec.template.spec.containers[0].image }}
+
+    # ─────────────────────────────────────────────
+    # CHECK RECURRENCE
+    # ─────────────────────────────────────────────
+
+    - name: Check previous readiness probe remediations in last 24h
+      uri:
+        url: "https://{{ aap_host }}/api/v2/jobs/?name=readiness-probe-remediation&status=successful"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ aap_token }}"
+        validate_certs: false
+        return_content: true
+      register: previous_jobs
+
+    - name: Log recurrence count
+      debug:
+        msg: "Previous readiness probe remediations in last 24h: {{ previous_jobs.json.count }}"
+
+    # ─────────────────────────────────────────────
+    # PREPARE EMAIL BODIES
+    # ─────────────────────────────────────────────
+
+    - name: Prepare rollback email body
+      set_fact:
+        email_subject_rollback: "[RF-02] Readiness Probe Failure Detected and Rolled Back - {{ deployment_name }}"
+        email_body_rollback: |
+          RF-02 Autonomous Remediation Platform - Alert
+
+          Severity    - WARNING
+          Scenario    - S6 Readiness Probe Failure Detection
+          Time        - {{ ansible_date_time.iso8601 }}
+
+          Affected Service
+          Deployment  - {{ deployment_name }}
+          Pod         - {{ pod_name }}
+          Namespace   - {{ namespace }}
+
+          Detection
+          Method      - Readiness probe failure detected
+          Action      - Automatic rollback to previous image.
+
+          Remediation Applied
+          Action               - Image rollback
+          Previous image       - {{ current_image_live }}
+          Image after rollback - {{ current_image }}
+          Occurrences today    - {{ previous_jobs.json.count + 1 }}
+          Status               - Rollout complete service healthy.
+
+          Required Action
+          The previous deployment version contained a readiness probe failure bug.
+          The rollback removed it from production.
+          Please investigate the readiness probe failure before redeploying.
+
+          This is an automated message from RF-02.
+          Do not reply to this email.
+
+    - name: Prepare restart email body
+      set_fact:
+        email_subject_restart: "[RF-02] Readiness Probe Failure Detected - Manual Fix Required - {{ deployment_name }}"
+        email_body_restart: |
+          RF-02 Autonomous Remediation Platform - Alert
+
+          Severity    - WARNING
+          Scenario    - S6 Readiness Probe Failure Detection
+          Time        - {{ ansible_date_time.iso8601 }}
+
+          Affected Service
+          Deployment  - {{ deployment_name }}
+          Pod         - {{ pod_name }}
+          Namespace   - {{ namespace }}
+
+          Detection
+          Method      - Readiness probe failure detected
+
+          Remediation Applied
+          Action            - Rolling restart applied.
+          Reason            - No previous image found rollback not possible.
+          Current image     - {{ current_image }}
+          Occurrences today - {{ previous_jobs.json.count + 1 }}
+          Status            - Rollout complete service healthy.
+
+          Manual Intervention Required
+          No previous deployment image exists for {{ deployment_name }}.
+          The readiness probe failure bug is still present in the running image.
+          Please fix the code and redeploy immediately.
+
+          This is an automated message from RF-02.
+          Do not reply to this email.
+
+    # ─────────────────────────────────────────────
+    # SEND EMAIL — Path A (rollback succeeded)
+    # ─────────────────────────────────────────────
+
+    - name: "[Email] Write rollback email body to temp file"
+      copy:
+        content: "{{ email_body_rollback }}"
+        dest: /tmp/rf02_email_body.txt
+      no_log: true
+      when: has_previous_revision | bool
+
+    - name: "[Email] Write rollback send script"
+      copy:
+        dest: /tmp/rf02_send_email.py
+        content: |
+          import smtplib
+          from email.mime.text import MIMEText
+          body = open('/tmp/rf02_email_body.txt').read()
+          msg = MIMEText(body)
+          msg['Subject'] = '{{ email_subject_rollback }}'
+          msg['From'] = '{{ smtp_user }}'
+          msg['To'] = '{{ smtp_user }}'
+          s = smtplib.SMTP('smtp.gmail.com', 587)
+          s.starttls()
+          s.login('{{ smtp_user }}', '{{ smtp_password }}')
+          s.sendmail('{{ smtp_user }}', '{{ smtp_user }}', msg.as_string())
+          s.quit()
+          print('Email sent successfully')
+      no_log: true
+      when: has_previous_revision | bool
+
+    - name: "[Email] Send rollback notification"
+      command: python3 /tmp/rf02_send_email.py
+      when: has_previous_revision | bool
+
+    # ─────────────────────────────────────────────
+    # SEND EMAIL — Path B (no rollback, restart only)
+    # ─────────────────────────────────────────────
+
+    - name: "[Email] Write restart email body to temp file"
+      copy:
+        content: "{{ email_body_restart }}"
+        dest: /tmp/rf02_email_body.txt
+      no_log: true
+      when: not (has_previous_revision | bool)
+
+    - name: "[Email] Write restart send script"
+      copy:
+        dest: /tmp/rf02_send_email.py
+        content: |
+          import smtplib
+          from email.mime.text import MIMEText
+          body = open('/tmp/rf02_email_body.txt').read()
+          msg = MIMEText(body)
+          msg['Subject'] = '{{ email_subject_restart }}'
+          msg['From'] = '{{ smtp_user }}'
+          msg['To'] = '{{ smtp_user }}'
+          s = smtplib.SMTP('smtp.gmail.com', 587)
+          s.starttls()
+          s.login('{{ smtp_user }}', '{{ smtp_password }}')
+          s.sendmail('{{ smtp_user }}', '{{ smtp_user }}', msg.as_string())
+          s.quit()
+          print('Email sent successfully')
+      no_log: true
+      when: not (has_previous_revision | bool)
+
+    - name: "[Email] Send restart notification"
+      command: python3 /tmp/rf02_send_email.py
+      when: not (has_previous_revision | bool)
+
+    # ─────────────────────────────────────────────
+    # FINAL REPORT
+    # ─────────────────────────────────────────────
+
+    - name: Report remediation complete
+      debug:
+        msg: >
+          S6 remediation complete — deployment={{ deployment_name }}
+          | rollback={{ has_previous_revision }}
+          | previous_image={{ current_image_live }}
+          | current_image={{ current_image }}
+          | occurrences today={{ previous_jobs.json.count + 1 }}
+          | email sent to {{ smtp_user }}

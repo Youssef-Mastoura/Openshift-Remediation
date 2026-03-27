@@ -1,0 +1,243 @@
+---
+- name: Remediate currencyservice Pod Readiness Probe Failure
+  hosts: localhost
+  connection: local
+  gather_facts: true
+
+  tasks:
+
+    # ─────────────────────────────────────────────
+    # EXTRACT ALERT INFO
+    # ─────────────────────────────────────────────
+
+    - name: Extract alert info from event
+      set_fact:
+        pod_name: "{{ event_data.pod }}"
+        namespace: "{{ event_data.namespace | default('ms-demo') }}"
+        service_name: "{{ event_data.service }}"
+
+    - name: Derive deployment name from pod name
+      set_fact:
+        deployment_name: "{{ pod_name | regex_replace('-[a-z0-9]+-[a-z0-9]+$', '') }}"
+
+    - name: Log remediation start
+      debug:
+        msg: "Remediation started — pod={{ pod_name }} deployment={{ deployment_name }}"
+
+    # ─────────────────────────────────────────────
+    # VERIFY DEPLOYMENT EXISTS IN NAMESPACE
+    # ─────────────────────────────────────────────
+
+    - name: Get deployment from namespace
+      kubernetes.core.k8s_info:
+        kind: Deployment
+        name: "{{ deployment_name }}"
+        namespace: "{{ namespace }}"
+        validate_certs: false
+      register: deployment_info
+
+    - name: Fail if deployment not found in namespace
+      fail:
+        msg: "Deployment {{ deployment_name }} not found in namespace {{ namespace }}"
+      when: deployment_info.resources | length == 0
+
+    # ─────────────────────────────────────────────
+    # ACTION 1 — INCREASE READINESS PROBE TIMEOUT
+    # ─────────────────────────────────────────────
+
+    - name: "[ReadinessProbe] Patch deployment with increased timeout"
+      kubernetes.core.k8s:
+        state: present
+        validate_certs: false
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: "{{ deployment_name }}"
+            namespace: "{{ namespace }}"
+          spec:
+            template:
+              spec:
+                containers:
+                  - name: "{{ deployment_name }}"
+                    readinessProbe:
+                      timeoutSeconds: 10
+                      periodSeconds: 10
+
+    - name: "[ReadinessProbe] Log increased timeout"
+      debug:
+        msg: "Readiness probe timeout increased to 10s for deployment {{ deployment_name }}"
+
+    # ─────────────────────────────────────────────
+    # ACTION 2 — SCALE UP DEPLOYMENT
+    # ─────────────────────────────────────────────
+
+    - name: "[Scale] Get current deployment info"
+      kubernetes.core.k8s_info:
+        kind: Deployment
+        name: "{{ deployment_name }}"
+        namespace: "{{ namespace }}"
+        validate_certs: false
+      register: deployment_info
+
+    - name: "[Scale] Extract current replica count"
+      set_fact:
+        current_replicas: "{{ deployment_info.resources[0].spec.replicas | int }}"
+
+    - name: "[Scale] Calculate new replica count (current × 1.5)"
+      set_fact:
+        new_replicas: "{{ (current_replicas | int * 1.5) | round(0, 'ceil') | int }}"
+
+    - name: "[Scale] Log replica change"
+      debug:
+        msg: "Scaling {{ deployment_name }}: {{ current_replicas }} → {{ new_replicas }} replicas"
+
+    - name: "[Scale] Scale up targeted deployment"
+      kubernetes.core.k8s_scale:
+        kind: Deployment
+        name: "{{ deployment_name }}"
+        namespace: "{{ namespace }}"
+        replicas: "{{ new_replicas }}"
+        validate_certs: false
+        wait: false
+
+    - name: Wait for scaled deployment to become ready
+      kubernetes.core.k8s_info:
+        kind: Deployment
+        name: "{{ deployment_name }}"
+        namespace: "{{ namespace }}"
+        validate_certs: false
+      register: scale_status
+      until: >-
+        scale_status.resources[0].status.readyReplicas is defined and
+        scale_status.resources[0].status.readyReplicas | int >= new_replicas | int
+      retries: 12
+      delay: 10
+
+    # ─────────────────────────────────────────────
+    # ACTION 3 — APPLY NETWORK POLICY
+    # ─────────────────────────────────────────────
+
+    - name: "[NetworkPolicy] Apply protective ingress policy on targeted deployment"
+      kubernetes.core.k8s:
+        state: present
+        validate_certs: false
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata:
+            name: "remediation-{{ deployment_name }}"
+            namespace: "{{ namespace }}"
+            annotations:
+              remediation/networkpolicy-applied-at: "{{ ansible_date_time.iso8601 }}"
+          spec:
+            podSelector:
+              matchLabels:
+                app: "{{ deployment_name }}"
+            policyTypes:
+              - Ingress
+            ingress:
+              - from:
+                  - namespaceSelector:
+                      matchLabels:
+                        kubernetes.io/metadata.name: openshift-ingress
+              - from:
+                  - podSelector: {}
+              - from:
+                  - namespaceSelector:
+                      matchLabels:
+                        kubernetes.io/metadata.name: openshift-monitoring
+
+    - name: "[NetworkPolicy] Log network policy applied"
+      debug:
+        msg: "NetworkPolicy remediation-{{ deployment_name }} applied in {{ namespace }}"
+
+    # ─────────────────────────────────────────────
+    # ACTION 4 — EMAIL NOTIFICATION
+    # ─────────────────────────────────────────────
+
+    - name: "[Email] Prepare email body"
+      set_fact:
+        email_subject: "[RF-02] currencyservice Pod Readiness Probe Failure Remediation"
+        email_body: |
+          RF-02 Autonomous Remediation Platform - Readiness Probe Failure Alert
+
+          Severity    - MEDIUM
+          Scenario    - currencyservice Pod Readiness Probe Failure
+          Time        - {{ ansible_date_time.iso8601 }}
+
+          Incident Details
+          Pod           - {{ pod_name }}
+          Deployment    - {{ deployment_name }}
+          Namespace     - {{ namespace }}
+          Service       - {{ service_name }}
+          Detection     - Readiness probe failure due to timeout
+
+          Automated Actions Taken
+
+          1. Readiness Probe Timeout Increased
+             Readiness probe timeout increased to 10s for deployment {{ deployment_name }}.
+
+          2. Deployment Scaled Up
+             {{ deployment_name }} scaled from {{ current_replicas }}
+             to {{ new_replicas }} replicas.
+
+          3. Network Policy Applied
+             NetworkPolicy remediation-{{ deployment_name }} created.
+             Ingress to {{ deployment_name }} restricted to:
+             - OpenShift ingress router
+             - Pods within {{ namespace }} namespace
+             - OpenShift monitoring namespace
+
+          Manual Cleanup Required (when incident is resolved)
+
+          Remove network policy:
+            oc delete networkpolicy remediation-{{ deployment_name }} \
+              -n {{ namespace }}
+
+          Scale back to original:
+            oc scale deployment {{ deployment_name }} \
+              -n {{ namespace }} --replicas={{ current_replicas }}
+
+          This is an automated message from RF-02.
+          Do not reply to this email.
+
+    - name: "[Email] Write email body to temp file"
+      copy:
+        content: "{{ email_body }}"
+        dest: /tmp/rf02_readinessprobe_email_body.txt
+      no_log: true
+
+    - name: "[Email] Write email send script"
+      copy:
+        dest: /tmp/rf02_readinessprobe_send_email.py
+        content: |
+          import smtplib
+          from email.mime.text import MIMEText
+          body = open('/tmp/rf02_readinessprobe_email_body.txt').read()
+          msg = MIMEText(body)
+          msg['Subject'] = '{{ email_subject }}'
+          msg['From'] = '{{ smtp_user }}'
+          msg['To'] = '{{ smtp_user }}'
+          s = smtplib.SMTP('smtp.gmail.com', 587)
+          s.starttls()
+          s.login('{{ smtp_user }}', '{{ smtp_password }}')
+          s.sendmail('{{ smtp_user }}', '{{ smtp_user }}', msg.as_string())
+          s.quit()
+          print('Email sent successfully')
+      no_log: true
+
+    - name: "[Email] Send readiness probe failure notification"
+      command: python3 /tmp/rf02_readinessprobe_send_email.py
+
+    - name: Report remediation complete
+      debug:
+        msg: >
+          currencyservice pod readiness probe failure remediation complete
+          | pod={{ pod_name }}
+          | deployment={{ deployment_name }}
+          | readiness_probe_timeout=10s
+          | replicas={{ current_replicas }} → {{ new_replicas }}
+          | networkpolicy=remediation-{{ deployment_name }} applied
+          | email sent to {{ smtp_user }}
+          | manual cleanup required by engineer

@@ -1,0 +1,60 @@
+---
+- name: PREFAS fallback remediation — rolling restart
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    namespace: ms-demo
+    pod_name: "{{ event_data.pod }}"
+
+  tasks:
+
+    - name: Extract deployment name from pod name
+      set_fact:
+        deployment_name: >-
+          {{ pod_name | regex_replace('-[a-z0-9]+-[a-z0-9]+$', '') }}
+
+    - name: Get current deployment info
+      kubernetes.core.k8s_info:
+        api_version: apps/v1
+        kind: Deployment
+        name: "{{ deployment_name }}"
+        namespace: "{{ namespace }}"
+      register: deployment_info
+      validate_certs: false
+
+    - name: Perform rolling restart
+      kubernetes.core.k8s:
+        api_version: apps/v1
+        kind: Deployment
+        name: "{{ deployment_name }}"
+        namespace: "{{ namespace }}"
+        definition:
+          spec:
+            template:
+              metadata:
+                annotations:
+                  kubectl.kubernetes.io/restartedAt: >-
+                    {{ ansible_date_time.iso8601 }}
+        validate_certs: false
+
+    - name: Send fallback notification
+      ansible.builtin.copy:
+        dest: /tmp/prefas_fallback_email.py
+        content: |
+          import smtplib
+          from email.mime.text import MIMEText
+          msg = MIMEText('PREFAS fallback: rolling restart on currencyservice')
+          msg['Subject'] = '[PREFAS] Fallback remediation: currencyservice'
+          msg['From'] = 'mastoura.youssef@gmail.com'
+          msg['To']   = 'mastoura.youssef@gmail.com'
+          s = smtplib.SMTP('smtp.gmail.com', 587)
+          s.starttls()
+          s.login('mastoura.youssef@gmail.com', 'hdqmmocqeovsxzlb')
+          s.send_message(msg)
+          s.quit()
+      no_log: true
+
+    - name: Execute fallback email
+      ansible.builtin.command: python3 /tmp/prefas_fallback_email.py
+      ignore_errors: true

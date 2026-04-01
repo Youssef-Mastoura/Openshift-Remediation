@@ -165,49 +165,67 @@
     # PHASE 5 — NOTIFICATION
     # ─────────────────────────────────────────
 
-    - name: "[PHASE 5] Send remediation report via email"
-      community.general.mail:
-        host: "{{ smtp_host }}"
-        port: "{{ smtp_port }}"
-        username: "{{ smtp_user }}"
-        password: "{{ smtp_password }}"
-        to: "{{ notify_email }}"
-        subject: >
-          [RF-02] OOMKilled Remediated — {{ deployment_name }} ({{ remediation_type }})
-        body: |
-          ╔══════════════════════════════════════════════════════════╗
-               RF-02 | Autonomous OOMKilled Remediation Report
-          ╚══════════════════════════════════════════════════════════╝
+    - name: "[PHASE 5] Write email body to temp file"
+      copy:
+        dest: /tmp/oom_email_body.txt
+        content: |
+          RF-02 Autonomous Remediation Platform — Alert
 
-          ALERT DETAILS
-          ─────────────────────────────────────────────────────────
+          Severity    : CRITICAL
+          Scenario    : S1 — OOMKilled Detection & Remediation
+          Time        : {{ ansible_date_time.iso8601 }}
+
+          AFFECTED SERVICE
+          ─────────────────────────────────────────────────────
           Namespace   : {{ app_namespace }}
           Pod         : {{ oom_pod }}
           Container   : {{ oom_container }}
           Deployment  : {{ deployment_name }}
           Strategy    : {{ remediation_type }}
-          Triggered at: {{ ansible_date_time.iso8601 }}
 
           REMEDIATION APPLIED
-          ─────────────────────────────────────────────────────────
+          ─────────────────────────────────────────────────────
           Memory Limit  : {{ current_mem_raw }} → {{ new_mem_limit }}
           Memory Request: recalculated to {{ new_mem_request }}
           {% if remediation_type == 'increase-mem-recurring' %}
           Replicas      : {{ current_replicas }} → {{ (current_replicas | int) + 1 }}
           Reason        : Recurring OOMKill (>2 restarts) — scale-out applied
           {% else %}
-          Replicas      : {{ current_replicas }} (unchanged)
+          Replicas      : {{ current_replicas }} (unchanged — first-time OOM)
           {% endif %}
 
           OUTCOME
-          ─────────────────────────────────────────────────────────
+          ─────────────────────────────────────────────────────
           ✅ Deployment rollout completed successfully.
           All pods are healthy and ready.
 
-          ──────────────────────────────────────────────────────────
-          This action was performed automatically by RF-02 PREFAS.
+          ──────────────────────────────────────────────────────
+          This action was performed automatically by RF-02.
           No manual intervention was required.
-          ──────────────────────────────────────────────────────────
+          ──────────────────────────────────────────────────────
+      no_log: true
+
+    - name: "[PHASE 5] Write email send script"
+      copy:
+        dest: /tmp/oom_send_email.py
+        content: |
+          import smtplib
+          from email.mime.text import MIMEText
+          body = open('/tmp/oom_email_body.txt').read()
+          msg = MIMEText(body)
+          msg['Subject'] = '[RF-02] OOMKilled Remediated — {{ deployment_name }} ({{ remediation_type }})'
+          msg['From'] = '{{ smtp_user }}'
+          msg['To'] = '{{ smtp_user }}'
+          s = smtplib.SMTP('smtp.gmail.com', 587)
+          s.starttls()
+          s.login('{{ smtp_user }}', '{{ smtp_password }}')
+          s.sendmail('{{ smtp_user }}', '{{ smtp_user }}', msg.as_string())
+          s.quit()
+          print('Email sent successfully')
+      no_log: true
+
+    - name: "[PHASE 5] Send remediation email"
+      command: python3 /tmp/oom_send_email.py
 
     - name: "[PHASE 5] Final summary log"
       debug:
@@ -217,5 +235,5 @@
           - "  Deployment : {{ deployment_name }}"
           - "  Memory     : {{ current_mem_raw }} → {{ new_mem_limit }}"
           - "{% if remediation_type == 'increase-mem-recurring' %}  Replicas   : {{ current_replicas }} → {{ (current_replicas | int) + 1 }}{% else %}  Replicas   : unchanged{% endif %}"
-          - "  Duration   : rollout verified after retries"
+          - "  Email      : sent to {{ smtp_user }}"
           - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

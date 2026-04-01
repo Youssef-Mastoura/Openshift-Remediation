@@ -51,16 +51,36 @@
 
     - name: "[PHASE 2] Abort if deployment not found"
       fail:
-        msg: "Deployment '{{ deployment_name }}' not found in namespace '{{ app_namespace }}'. Aborting remediation."
+        msg: "Deployment '{{ deployment_name }}' not found in namespace '{{ app_namespace }}'. Aborting."
       when: deployment_info.resources | length == 0
 
-    - name: "[PHASE 2] Extract current memory limit"
+    - name: "[PHASE 2] Extract current memory limit and replica count"
       set_fact:
         current_mem_raw: >-
           {{ deployment_info.resources[0].spec.template.spec.containers
              | selectattr('name', '==', oom_container)
              | map(attribute='resources.limits.memory') | first }}
         current_replicas: "{{ deployment_info.resources[0].spec.replicas | int }}"
+        last_remediation_time: >-
+          {{ deployment_info.resources[0].metadata.annotations
+             | default({})
+             | dict2items
+             | selectattr('key', '==', 'remediation/timestamp')
+             | map(attribute='value')
+             | list
+             | first
+             | default('') }}
+
+    - name: "[PHASE 2] Abort if remediation was already applied in the last 5 minutes"
+      fail:
+        msg: >
+          ⚠️ Duplicate trigger detected. Remediation was already applied at
+          {{ last_remediation_time }}. Skipping to prevent cascading changes.
+      when: >
+        last_remediation_time != '' and
+        ((ansible_date_time.epoch | int) -
+         (last_remediation_time | regex_replace('Z$', '+00:00') | to_datetime('%Y-%m-%dT%H:%M:%S%z') | int))
+        < 300
 
     - name: "[PHASE 2] Convert memory limit to Mi and calculate new values"
       set_fact:

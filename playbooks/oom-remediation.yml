@@ -1,5 +1,5 @@
 ---
-- name: OOMKilled Memory Remediation
+- name: OOMKilled — Autonomous Memory Remediation
   hosts: localhost
   connection: local
   gather_facts: true
@@ -8,29 +8,40 @@
     app_namespace: "ms-demo"
 
   tasks:
-    - name: Log remediation start
-      debug:
-        msg: "OOMKilled alert received — starting memory remediation"
 
-    - name: Extract pod, container and remediation type from event
+    # ─────────────────────────────────────────
+    # PHASE 1 — EVENT PARSING
+    # ─────────────────────────────────────────
+
+    - name: "[PHASE 1] Extract alert context from EDA event"
       set_fact:
         oom_pod: "{{ event.payload.alerts[0].labels.pod }}"
         oom_container: "{{ event.payload.alerts[0].labels.container }}"
         remediation_type: "{{ event.payload.alerts[0].labels.remediation }}"
+        alert_namespace: "{{ event.payload.alerts[0].labels.namespace }}"
 
-    - name: Log extracted values
-      debug:
-        msg: "OOMKilled on pod={{ oom_pod }} container={{ oom_container }} type={{ remediation_type }}"
-
-    - name: Derive deployment name from pod name
+    - name: "[PHASE 1] Derive deployment name from pod name"
       set_fact:
         deployment_name: "{{ oom_pod | regex_replace('-[a-z0-9]+-[a-z0-9]+$', '') }}"
 
-    - name: Log derived deployment name
+    - name: "[PHASE 1] Log parsed alert context"
       debug:
-        msg: "Derived deployment name: {{ deployment_name }}"
+        msg:
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - "  RF-02 | OOMKilled Remediation Initiated"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - "  Pod         : {{ oom_pod }}"
+          - "  Container   : {{ oom_container }}"
+          - "  Deployment  : {{ deployment_name }}"
+          - "  Namespace   : {{ alert_namespace }}"
+          - "  Strategy    : {{ remediation_type }}"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-    - name: Get Deployment info
+    # ─────────────────────────────────────────
+    # PHASE 2 — DISCOVERY
+    # ─────────────────────────────────────────
+
+    - name: "[PHASE 2] Fetch Deployment spec"
       kubernetes.core.k8s_info:
         kind: Deployment
         name: "{{ deployment_name }}"
@@ -38,33 +49,40 @@
         validate_certs: false
       register: deployment_info
 
-    - name: Extract current memory limit from Deployment spec
+    - name: "[PHASE 2] Abort if deployment not found"
+      fail:
+        msg: "Deployment '{{ deployment_name }}' not found in namespace '{{ app_namespace }}'. Aborting remediation."
+      when: deployment_info.resources | length == 0
+
+    - name: "[PHASE 2] Extract current memory limit"
       set_fact:
         current_mem_raw: >-
           {{ deployment_info.resources[0].spec.template.spec.containers
              | selectattr('name', '==', oom_container)
              | map(attribute='resources.limits.memory') | first }}
+        current_replicas: "{{ deployment_info.resources[0].spec.replicas | int }}"
 
-    - name: Convert memory limit to Mi integer
+    - name: "[PHASE 2] Convert memory limit to Mi and calculate new values"
       set_fact:
         current_mem_mi: "{{ current_mem_raw | regex_replace('Mi', '') | int }}"
 
-    - name: Calculate new memory limit (current x 1.5)
+    - name: "[PHASE 2] Calculate new memory limit (×1.5) and request (×0.75 of new)"
       set_fact:
         new_mem_limit: "{{ (current_mem_mi | int * 1.5) | int }}Mi"
+        new_mem_request: "{{ (current_mem_mi | int * 1.5 * 0.75) | int }}Mi"
 
-    - name: Get current replica count
-      set_fact:
-        current_replicas: "{{ deployment_info.resources[0].spec.replicas | int }}"
-
-    - name: Log deployment and memory values
+    - name: "[PHASE 2] Log remediation plan"
       debug:
-        msg: >-
-          Deployment={{ deployment_name }} container={{ oom_container }}
-          current_memory={{ current_mem_raw }} new_memory={{ new_mem_limit }}
-          current_replicas={{ current_replicas }} remediation_type={{ remediation_type }}
+        msg:
+          - "  Memory : {{ current_mem_raw }} → {{ new_mem_limit }}"
+          - "  Request: recalculated to {{ new_mem_request }}"
+          - "  Replicas: {{ current_replicas }}{% if remediation_type == 'increase-mem-recurring' %} → {{ (current_replicas | int) + 1 }}{% else %} (unchanged){% endif %}"
 
-    - name: Patch deployment — increase memory limit by 1.5x
+    # ─────────────────────────────────────────
+    # PHASE 3 — REMEDIATION
+    # ─────────────────────────────────────────
+
+    - name: "[PHASE 3] Patch deployment — increase memory limit by 1.5×"
       kubernetes.core.k8s:
         state: present
         validate_certs: false
@@ -75,9 +93,11 @@
             name: "{{ deployment_name }}"
             namespace: "{{ app_namespace }}"
             annotations:
-              remediation/oom-memory-increased-at: "{{ ansible_date_time.iso8601 }}"
-              remediation/oom-previous-limit: "{{ current_mem_raw }}"
-              remediation/oom-new-limit: "{{ new_mem_limit }}"
+              remediation/action: "oom-memory-increase"
+              remediation/triggered-by: "RF-02-PREFAS"
+              remediation/timestamp: "{{ ansible_date_time.iso8601 }}"
+              remediation/previous-mem-limit: "{{ current_mem_raw }}"
+              remediation/new-mem-limit: "{{ new_mem_limit }}"
           spec:
             template:
               spec:
@@ -87,9 +107,9 @@
                       limits:
                         memory: "{{ new_mem_limit }}"
                       requests:
-                        memory: "{{ (current_mem_mi | int * 0.75) | int }}Mi"
+                        memory: "{{ new_mem_request }}"
 
-    - name: Scale up replicas by 1 (recurring OOM only)
+    - name: "[PHASE 3] Scale up replicas by 1 (recurring OOM only)"
       when: remediation_type == "increase-mem-recurring"
       kubernetes.core.k8s_scale:
         api_version: apps/v1
@@ -99,7 +119,7 @@
         replicas: "{{ (current_replicas | int) + 1 }}"
         validate_certs: false
 
-    - name: Annotate replica scale (recurring OOM only)
+    - name: "[PHASE 3] Annotate scale event (recurring OOM only)"
       when: remediation_type == "increase-mem-recurring"
       kubernetes.core.k8s:
         state: present
@@ -111,11 +131,15 @@
             name: "{{ deployment_name }}"
             namespace: "{{ app_namespace }}"
             annotations:
-              remediation/oom-replicas-scaled-at: "{{ ansible_date_time.iso8601 }}"
-              remediation/oom-previous-replicas: "{{ current_replicas | string }}"
-              remediation/oom-new-replicas: "{{ ((current_replicas | int) + 1) | string }}"
+              remediation/replicas-scaled-at: "{{ ansible_date_time.iso8601 }}"
+              remediation/previous-replicas: "{{ current_replicas | string }}"
+              remediation/new-replicas: "{{ ((current_replicas | int) + 1) | string }}"
 
-    - name: Wait for rollout to complete
+    # ─────────────────────────────────────────
+    # PHASE 4 — VERIFICATION
+    # ─────────────────────────────────────────
+
+    - name: "[PHASE 4] Wait for deployment rollout to complete"
       kubernetes.core.k8s_info:
         kind: Deployment
         name: "{{ deployment_name }}"
@@ -126,15 +150,72 @@
         rollout_status.resources[0].status.readyReplicas is defined and
         rollout_status.resources[0].status.readyReplicas ==
         rollout_status.resources[0].spec.replicas
-      retries: 12
+      retries: 18
       delay: 10
 
-    - name: Remediation summary
-      debug:
-        msg: >-
-          ✅ Remediation complete for {{ deployment_name }}.
-          Strategy={{ remediation_type }}.
-          Memory {{ current_mem_raw }} → {{ new_mem_limit }}.
+    - name: "[PHASE 4] Verify rollout succeeded"
+      fail:
+        msg: "Rollout did not complete within timeout. Manual inspection required."
+      when: >-
+        rollout_status.resources[0].status.readyReplicas is not defined or
+        rollout_status.resources[0].status.readyReplicas !=
+        rollout_status.resources[0].spec.replicas
+
+    # ─────────────────────────────────────────
+    # PHASE 5 — NOTIFICATION
+    # ─────────────────────────────────────────
+
+    - name: "[PHASE 5] Send remediation report via email"
+      community.general.mail:
+        host: "{{ smtp_host }}"
+        port: "{{ smtp_port }}"
+        username: "{{ smtp_user }}"
+        password: "{{ smtp_password }}"
+        to: "{{ notify_email }}"
+        subject: >
+          [RF-02] OOMKilled Remediated — {{ deployment_name }} ({{ remediation_type }})
+        body: |
+          ╔══════════════════════════════════════════════════════════╗
+               RF-02 | Autonomous OOMKilled Remediation Report
+          ╚══════════════════════════════════════════════════════════╝
+
+          ALERT DETAILS
+          ─────────────────────────────────────────────────────────
+          Namespace   : {{ app_namespace }}
+          Pod         : {{ oom_pod }}
+          Container   : {{ oom_container }}
+          Deployment  : {{ deployment_name }}
+          Strategy    : {{ remediation_type }}
+          Triggered at: {{ ansible_date_time.iso8601 }}
+
+          REMEDIATION APPLIED
+          ─────────────────────────────────────────────────────────
+          Memory Limit  : {{ current_mem_raw }} → {{ new_mem_limit }}
+          Memory Request: recalculated to {{ new_mem_request }}
           {% if remediation_type == 'increase-mem-recurring' %}
-          Replicas {{ current_replicas }} → {{ (current_replicas | int) + 1 }}.
+          Replicas      : {{ current_replicas }} → {{ (current_replicas | int) + 1 }}
+          Reason        : Recurring OOMKill (>2 restarts) — scale-out applied
+          {% else %}
+          Replicas      : {{ current_replicas }} (unchanged)
           {% endif %}
+
+          OUTCOME
+          ─────────────────────────────────────────────────────────
+          ✅ Deployment rollout completed successfully.
+          All pods are healthy and ready.
+
+          ──────────────────────────────────────────────────────────
+          This action was performed automatically by RF-02 PREFAS.
+          No manual intervention was required.
+          ──────────────────────────────────────────────────────────
+
+    - name: "[PHASE 5] Final summary log"
+      debug:
+        msg:
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - "  ✅ Remediation COMPLETE"
+          - "  Deployment : {{ deployment_name }}"
+          - "  Memory     : {{ current_mem_raw }} → {{ new_mem_limit }}"
+          - "{% if remediation_type == 'increase-mem-recurring' %}  Replicas   : {{ current_replicas }} → {{ (current_replicas | int) + 1 }}{% else %}  Replicas   : unchanged{% endif %}"
+          - "  Duration   : rollout verified after retries"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

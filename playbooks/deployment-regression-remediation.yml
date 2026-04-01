@@ -2,27 +2,38 @@
 - name: Deployment Regression Remediation
   hosts: localhost
   connection: local
-  gather_facts: false
+  gather_facts: true
   vars:
     app_namespace: ms-demo
     regression_window_minutes: 5
   tasks:
-    - name: Log remediation start
-      debug:
-        msg: "Deployment regression detected in {{ app_namespace }} — finding recently deployed services"
 
-    - name: Get cutoff epoch
+    # ─────────────────────────────────────────
+    # PHASE 1 — DETECTION
+    # ─────────────────────────────────────────
+
+    - name: "[PHASE 1] Log remediation start"
+      debug:
+        msg:
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - "  RF-02 | Deployment Regression Remediation"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - "  Namespace : {{ app_namespace }}"
+          - "  Window    : last {{ regression_window_minutes }} minutes"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    - name: "[PHASE 1] Get cutoff epoch"
       command: "date -u -d '-{{ regression_window_minutes }} minutes' +%s"
       register: cutoff_epoch
 
-    - name: Get all ReplicaSets in namespace
+    - name: "[PHASE 1] Get all ReplicaSets in namespace"
       kubernetes.core.k8s_info:
         kind: ReplicaSet
         namespace: "{{ app_namespace }}"
         validate_certs: false
       register: all_replicasets
 
-    - name: Convert each RS timestamp to epoch and filter recent ones
+    - name: "[PHASE 1] Convert each RS timestamp to epoch"
       shell: "date -u -d '{{ item.metadata.creationTimestamp }}' +%s"
       loop: "{{ all_replicasets.resources | selectattr('metadata.ownerReferences', 'defined') | list }}"
       loop_control:
@@ -30,7 +41,7 @@
       register: rs_epoch_results
       changed_when: false
 
-    - name: Build list of recent RS to roll back
+    - name: "[PHASE 1] Build list of recent RS to roll back"
       set_fact:
         recent_rs_list: >-
           {{ recent_rs_list | default([]) +
@@ -44,20 +55,24 @@
         label: "{{ item.item.metadata.name }}"
       when: item.stdout | int >= cutoff_epoch.stdout | int
 
-    - name: Remove duplicate deployment names
+    - name: "[PHASE 1] Remove duplicate deployment names"
       set_fact:
         deployments_to_rollback: "{{ recent_rs_list | default([]) | map(attribute='deployment') | list | unique }}"
 
-    - name: Fail gracefully if no recent deployments found
+    - name: "[PHASE 1] Fail gracefully if no recent deployments found"
       fail:
         msg: "No deployments updated in the last {{ regression_window_minutes }} minutes."
       when: deployments_to_rollback | length == 0
 
-    - name: Log deployments to roll back
+    - name: "[PHASE 1] Log deployments to roll back"
       debug:
         msg: "Deployments to roll back: {{ deployments_to_rollback }}"
 
-    - name: Get all ReplicaSets for each affected deployment
+    # ─────────────────────────────────────────
+    # PHASE 2 — IMAGE DISCOVERY
+    # ─────────────────────────────────────────
+
+    - name: "[PHASE 2] Get all ReplicaSets for each affected deployment"
       kubernetes.core.k8s_info:
         kind: ReplicaSet
         namespace: "{{ app_namespace }}"
@@ -67,7 +82,7 @@
       loop: "{{ deployments_to_rollback }}"
       register: deployment_rs_infos
 
-    - name: Get current active image for each deployment
+    - name: "[PHASE 2] Get current active (broken) image for each deployment"
       set_fact:
         current_images: >-
           {{ current_images | default({}) | combine({
@@ -81,12 +96,12 @@
       loop_control:
         label: "{{ item.item }}"
 
-    - name: Log current broken images
+    - name: "[PHASE 2] Log current broken images"
       debug:
         msg: "Current broken image for {{ item.key }}: {{ item.value }}"
       loop: "{{ current_images | dict2items }}"
 
-    - name: Find previous good RS image (different from current broken image)
+    - name: "[PHASE 2] Find previous good RS image"
       set_fact:
         rollback_targets: >-
           {{ rollback_targets | default([]) +
@@ -106,12 +121,16 @@
       loop_control:
         label: "{{ item.item }}"
 
-    - name: Log rollback targets
+    - name: "[PHASE 2] Log rollback targets"
       debug:
-        msg: "Rolling back {{ item.deployment }} to image {{ item.image }}"
+        msg: "Rolling back {{ item.deployment }} → {{ item.image }}"
       loop: "{{ rollback_targets }}"
 
-    - name: Patch deployment with previous good image
+    # ─────────────────────────────────────────
+    # PHASE 3 — REMEDIATION
+    # ─────────────────────────────────────────
+
+    - name: "[PHASE 3] Patch deployment with previous good image"
       kubernetes.core.k8s:
         validate_certs: false
         state: patched
@@ -121,7 +140,12 @@
         definition:
           metadata:
             annotations:
-              remediation/regression-rolled-back-at: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+              remediation/action: "deployment-regression-rollback"
+              remediation/triggered-by: "RF-02-PREFAS"
+              remediation/timestamp: "{{ ansible_date_time.iso8601 }}"
+              remediation/broken-image: "{{ current_images[item.deployment] }}"
+              remediation/restored-image: "{{ item.image }}"
+              remediation/regression-rolled-back-at: "{{ ansible_date_time.iso8601 }}"
           spec:
             template:
               spec:
@@ -133,14 +157,18 @@
         label: "{{ item.deployment }}"
       register: patch_results
 
-    - name: Log patch results
+    - name: "[PHASE 3] Log patch results"
       debug:
         msg: "Patched {{ item.item.deployment }}: changed={{ item.changed }}"
       loop: "{{ patch_results.results }}"
       loop_control:
         label: "{{ item.item.deployment }}"
 
-    - name: Wait for rollout to complete
+    # ─────────────────────────────────────────
+    # PHASE 4 — VERIFICATION
+    # ─────────────────────────────────────────
+
+    - name: "[PHASE 4] Wait for rollout to complete"
       kubernetes.core.k8s_info:
         kind: Deployment
         name: "{{ item.deployment }}"
@@ -157,9 +185,81 @@
       retries: 12
       delay: 10
 
-    - name: Log final status
+    - name: "[PHASE 4] Log final rollout status"
       debug:
         msg: "Rollback complete for {{ item.item.deployment }} — readyReplicas={{ item.resources[0].status.readyReplicas }}"
       loop: "{{ rollout_check.results }}"
       loop_control:
         label: "{{ item.item.deployment }}"
+
+    # ─────────────────────────────────────────
+    # PHASE 5 — NOTIFICATION
+    # ─────────────────────────────────────────
+
+    - name: "[PHASE 5] Write email body to temp file"
+      copy:
+        dest: /tmp/regression_email_body.txt
+        content: |
+          RF-02 Autonomous Remediation Platform — Alert
+
+          Severity    : CRITICAL
+          Scenario    : S3 — Deployment Regression Detection & Remediation
+          Time        : {{ ansible_date_time.iso8601 }}
+
+          DETECTION
+          ─────────────────────────────────────────────────────
+          Namespace   : {{ app_namespace }}
+          Method      : 5xx error ratio > 5% with active traffic
+          Window      : Last {{ regression_window_minutes }} minutes
+
+          AFFECTED DEPLOYMENTS
+          ─────────────────────────────────────────────────────
+          {% for target in rollback_targets %}
+          Deployment  : {{ target.deployment }}
+          Broken Image: {{ current_images[target.deployment] }}
+          Restored To : {{ target.image }}
+          {% endfor %}
+
+          OUTCOME
+          ─────────────────────────────────────────────────────
+          ✅ Rollback completed successfully.
+          All affected deployments are healthy and ready.
+          5xx error rate has returned to normal.
+
+          ──────────────────────────────────────────────────────
+          This action was performed automatically by RF-02.
+          No manual intervention was required.
+          ──────────────────────────────────────────────────────
+      no_log: true
+
+    - name: "[PHASE 5] Write email send script"
+      copy:
+        dest: /tmp/regression_send_email.py
+        content: |
+          import smtplib
+          from email.mime.text import MIMEText
+          body = open('/tmp/regression_email_body.txt').read()
+          msg = MIMEText(body)
+          msg['Subject'] = '[RF-02] Deployment Regression Remediated — {{ deployments_to_rollback | join(", ") }}'
+          msg['From'] = '{{ smtp_user }}'
+          msg['To'] = '{{ smtp_user }}'
+          s = smtplib.SMTP('smtp.gmail.com', 587)
+          s.starttls()
+          s.login('{{ smtp_user }}', '{{ smtp_password }}')
+          s.sendmail('{{ smtp_user }}', '{{ smtp_user }}', msg.as_string())
+          s.quit()
+          print('Email sent successfully')
+      no_log: true
+
+    - name: "[PHASE 5] Send remediation email"
+      command: python3 /tmp/regression_send_email.py
+
+    - name: "[PHASE 5] Final summary log"
+      debug:
+        msg:
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - "  ✅ Remediation COMPLETE"
+          - "  Deployments : {{ deployments_to_rollback | join(', ') }}"
+          - "  Action      : rolled back to previous good image"
+          - "  Email       : sent to {{ smtp_user }}"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

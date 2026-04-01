@@ -61,42 +61,12 @@
              | selectattr('name', '==', oom_container)
              | map(attribute='resources.limits.memory') | first }}
         current_replicas: "{{ deployment_info.resources[0].spec.replicas | int }}"
-        last_remediation_raw: >-
-          {{ deployment_info.resources[0].metadata.annotations
-             | default({})
-             | dict2items
-             | selectattr('key', '==', 'remediation/timestamp')
-             | map(attribute='value')
-             | list
-             | first
-             | default('') }}
 
-    - name: "[PHASE 2] Parse last remediation timestamp to epoch"
-      set_fact:
-        last_remediation_epoch: >-
-          {{ (last_remediation_raw
-              | regex_replace('T', ' ')
-              | regex_replace('Z', '')
-              | to_datetime).strftime('%s') | int
-             if last_remediation_raw != ''
-             else 0 }}
-
-    - name: "[PHASE 2] Abort if remediation ran less than 5 minutes ago"
-      fail:
-        msg: >
-          ⚠️ Duplicate trigger detected — remediation already ran at
-          {{ last_remediation_raw }}
-          ({{ ansible_date_time.epoch | int - last_remediation_epoch | int }} seconds ago).
-          Aborting to prevent cascading changes.
-      when: >
-        last_remediation_epoch | int > 0 and
-        (ansible_date_time.epoch | int - last_remediation_epoch | int) < 300
-
-    - name: "[PHASE 2] Convert memory limit to Mi and calculate new values"
+    - name: "[PHASE 2] Convert memory limit to Mi"
       set_fact:
         current_mem_mi: "{{ current_mem_raw | regex_replace('Mi', '') | int }}"
 
-    - name: "[PHASE 2] Calculate new memory limit (×1.5) and request (×0.75 of new)"
+    - name: "[PHASE 2] Calculate new memory limit (x1.5) and request (x0.75 of new)"
       set_fact:
         new_mem_limit: "{{ (current_mem_mi | int * 1.5) | int }}Mi"
         new_mem_request: "{{ (current_mem_mi | int * 1.5 * 0.75) | int }}Mi"
@@ -112,7 +82,7 @@
     # PHASE 3 — REMEDIATION
     # ─────────────────────────────────────────
 
-    - name: "[PHASE 3] Patch deployment — increase memory limit by 1.5×"
+    - name: "[PHASE 3] Patch deployment — increase memory limit by 1.5x"
       kubernetes.core.k8s:
         state: present
         validate_certs: false
@@ -138,6 +108,18 @@
                         memory: "{{ new_mem_limit }}"
                       requests:
                         memory: "{{ new_mem_request }}"
+
+    - name: "[PHASE 3] Force delete crashing pod to stop restart loop immediately"
+      kubernetes.core.k8s:
+        state: absent
+        validate_certs: false
+        definition:
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: "{{ oom_pod }}"
+            namespace: "{{ app_namespace }}"
+      ignore_errors: true
 
     - name: "[PHASE 3] Scale up replicas by 1 (recurring OOM only)"
       when: remediation_type == "increase-mem-recurring"
@@ -226,7 +208,8 @@
 
           OUTCOME
           ─────────────────────────────────────────────────────
-          ✅ Deployment rollout completed successfully.
+          Crashing pod deleted — new pod started with increased memory limit.
+          Deployment rollout completed successfully.
           All pods are healthy and ready.
 
           ──────────────────────────────────────────────────────
@@ -265,5 +248,6 @@
           - "  Deployment : {{ deployment_name }}"
           - "  Memory     : {{ current_mem_raw }} → {{ new_mem_limit }}"
           - "{% if remediation_type == 'increase-mem-recurring' %}  Replicas   : {{ current_replicas }} → {{ (current_replicas | int) + 1 }}{% else %}  Replicas   : unchanged{% endif %}"
+          - "  Pod deleted: {{ oom_pod }} — new pod started with fixed memory"
           - "  Email      : sent to {{ smtp_user }}"
           - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

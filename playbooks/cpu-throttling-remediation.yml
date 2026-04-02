@@ -64,9 +64,9 @@
       set_fact:
         current_cpu_millicores: "{{ current_cpu_raw | regex_replace('m', '') | int }}"
 
-    - name: "[PHASE 2] Calculate new CPU limit (x1.5)"
+    - name: "[PHASE 2] Calculate new CPU limit (x3)"
       set_fact:
-        new_cpu_limit: "{{ (current_cpu_millicores | int * 1.5) | int }}m"
+        new_cpu_limit: "{{ (current_cpu_millicores | int * 3) | int }}m"
         new_replicas: "{{ (current_replicas | int) + 1 }}"
 
     - name: "[PHASE 2] Log remediation plan"
@@ -74,13 +74,13 @@
         msg:
           - "  CPU Limit : {{ current_cpu_raw }} → {{ new_cpu_limit }}"
           - "  Replicas  : {{ current_replicas }} → {{ new_replicas }}"
-          - "  Strategy  : Vertical (CPU x1.5) + Horizontal (+1 replica)"
+          - "  Strategy  : Vertical (CPU x3) + Horizontal (+1 replica)"
 
     # ─────────────────────────────────────────
     # PHASE 3 — REMEDIATION
     # ─────────────────────────────────────────
 
-    - name: "[PHASE 3] Patch deployment — increase CPU limit by 1.5x"
+    - name: "[PHASE 3] Patch deployment — increase CPU limit by 3x"
       kubernetes.core.k8s:
         validate_certs: false
         state: present

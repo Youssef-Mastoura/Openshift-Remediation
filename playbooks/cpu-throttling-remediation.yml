@@ -105,30 +105,6 @@
                       limits:
                         cpu: "{{ new_cpu_limit }}"
 
-    - name: "[PHASE 3] Scale up replicas by 1 (horizontal scaling)"
-      kubernetes.core.k8s_scale:
-        api_version: apps/v1
-        kind: Deployment
-        name: "{{ deployment_name }}"
-        namespace: "{{ app_namespace }}"
-        replicas: "{{ new_replicas }}"
-        validate_certs: false
-
-    - name: "[PHASE 3] Annotate scale event"
-      kubernetes.core.k8s:
-        state: present
-        validate_certs: false
-        definition:
-          apiVersion: apps/v1
-          kind: Deployment
-          metadata:
-            name: "{{ deployment_name }}"
-            namespace: "{{ app_namespace }}"
-            annotations:
-              remediation/replicas-scaled-at: "{{ ansible_date_time.iso8601 }}"
-              remediation/previous-replicas: "{{ current_replicas | string }}"
-              remediation/new-replicas: "{{ new_replicas | string }}"
-
     # ─────────────────────────────────────────
     # PHASE 4 — VERIFICATION
     # ─────────────────────────────────────────
@@ -154,6 +130,44 @@
         rollout_status.resources[0].status.readyReplicas is not defined or
         rollout_status.resources[0].status.readyReplicas !=
         rollout_status.resources[0].spec.replicas
+
+    - name: "[PHASE 4] Scale up replicas by 1 (horizontal scaling)"
+      kubernetes.core.k8s_scale:
+        api_version: apps/v1
+        kind: Deployment
+        name: "{{ deployment_name }}"
+        namespace: "{{ app_namespace }}"
+        replicas: "{{ new_replicas }}"
+        validate_certs: false
+
+    - name: "[PHASE 4] Annotate scale event"
+      kubernetes.core.k8s:
+        state: present
+        validate_certs: false
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: "{{ deployment_name }}"
+            namespace: "{{ app_namespace }}"
+            annotations:
+              remediation/replicas-scaled-at: "{{ ansible_date_time.iso8601 }}"
+              remediation/previous-replicas: "{{ current_replicas | string }}"
+              remediation/new-replicas: "{{ new_replicas | string }}"
+
+    - name: "[PHASE 4] Wait for scale rollout to complete"
+      kubernetes.core.k8s_info:
+        kind: Deployment
+        name: "{{ deployment_name }}"
+        namespace: "{{ app_namespace }}"
+        validate_certs: false
+      register: scale_status
+      until: >-
+        scale_status.resources[0].status.readyReplicas is defined and
+        scale_status.resources[0].status.readyReplicas ==
+        scale_status.resources[0].spec.replicas
+      retries: 18
+      delay: 10
 
     # ─────────────────────────────────────────
     # PHASE 5 — NOTIFICATION
@@ -186,7 +200,7 @@
 
           OUTCOME
           ─────────────────────────────────────────────────────
-          ✅ Deployment rollout completed successfully.
+          Deployment rollout completed successfully.
           All pods are healthy and ready.
 
           ──────────────────────────────────────────────────────

@@ -1,5 +1,5 @@
 ---
-- name: CPU Throttling Remediation
+- name: CPU Throttling — Autonomous Remediation
   hosts: localhost
   connection: local
   gather_facts: true
@@ -9,50 +9,37 @@
 
   tasks:
 
-    - name: Log remediation start
-      debug:
-        msg: "CPU throttling alert fired in {{ app_namespace }}"
+    # ─────────────────────────────────────────
+    # PHASE 1 — EVENT PARSING
+    # ─────────────────────────────────────────
 
-    - name: Extract pod and container from event
+    - name: "[PHASE 1] Extract alert context from EDA event"
       set_fact:
         throttled_pod: "{{ event.payload.alerts[0].labels.pod }}"
         throttled_container: "{{ event.payload.alerts[0].labels.container }}"
+        alert_namespace: "{{ event.payload.alerts[0].labels.namespace }}"
 
-    - name: Log extracted values
+    - name: "[PHASE 1] Derive deployment name from pod name"
+      set_fact:
+        deployment_name: "{{ throttled_pod | regex_replace('-[a-z0-9]+-[a-z0-9]+$', '') }}"
+
+    - name: "[PHASE 1] Log parsed alert context"
       debug:
-        msg: "Throttling detected on pod={{ throttled_pod }} container={{ throttled_container }}"
+        msg:
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - "  RF-02 | CPU Throttling Remediation Initiated"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - "  Pod         : {{ throttled_pod }}"
+          - "  Container   : {{ throttled_container }}"
+          - "  Deployment  : {{ deployment_name }}"
+          - "  Namespace   : {{ alert_namespace }}"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-    - name: Get pod info
-      kubernetes.core.k8s_info:
-        kind: Pod
-        name: "{{ throttled_pod }}"
-        namespace: "{{ app_namespace }}"
-        validate_certs: false
-      register: pod_info
+    # ─────────────────────────────────────────
+    # PHASE 2 — DISCOVERY
+    # ─────────────────────────────────────────
 
-    - name: Extract ReplicaSet name
-      set_fact:
-        replicaset_name: >-
-          {{ pod_info.resources[0].metadata.ownerReferences
-             | selectattr('kind', '==', 'ReplicaSet')
-             | map(attribute='name') | first }}
-
-    - name: Get ReplicaSet info
-      kubernetes.core.k8s_info:
-        kind: ReplicaSet
-        name: "{{ replicaset_name }}"
-        namespace: "{{ app_namespace }}"
-        validate_certs: false
-      register: rs_info
-
-    - name: Extract Deployment name
-      set_fact:
-        deployment_name: >-
-          {{ rs_info.resources[0].metadata.ownerReferences
-             | selectattr('kind', '==', 'Deployment')
-             | map(attribute='name') | first }}
-
-    - name: Get Deployment info
+    - name: "[PHASE 2] Fetch Deployment spec"
       kubernetes.core.k8s_info:
         kind: Deployment
         name: "{{ deployment_name }}"
@@ -60,38 +47,55 @@
         validate_certs: false
       register: deployment_info
 
-    - name: Extract current CPU limit
+    - name: "[PHASE 2] Abort if deployment not found"
+      fail:
+        msg: "Deployment '{{ deployment_name }}' not found. Aborting."
+      when: deployment_info.resources | length == 0
+
+    - name: "[PHASE 2] Extract current CPU limit and replica count"
       set_fact:
-        current_cpu_limit_raw: >-
+        current_cpu_raw: >-
           {{ deployment_info.resources[0].spec.template.spec.containers
              | selectattr('name', '==', throttled_container)
-             | map(attribute='resources.limits.cpu')
-             | first }}
+             | map(attribute='resources.limits.cpu') | first }}
+        current_replicas: "{{ deployment_info.resources[0].spec.replicas | int }}"
 
-    - name: Convert CPU limit to millicores integer
+    - name: "[PHASE 2] Convert CPU limit to millicores integer"
       set_fact:
-        current_cpu_millicores: >-
-          {{ current_cpu_limit_raw | regex_replace('m', '') | int }}
+        current_cpu_millicores: "{{ current_cpu_raw | regex_replace('m', '') | int }}"
 
-    - name: Calculate new CPU limit (current x 1.5)
+    - name: "[PHASE 2] Calculate new CPU limit (x1.5)"
       set_fact:
         new_cpu_limit: "{{ (current_cpu_millicores | int * 1.5) | int }}m"
+        new_replicas: "{{ (current_replicas | int) + 1 }}"
 
-    - name: Log deployment and CPU values
+    - name: "[PHASE 2] Log remediation plan"
       debug:
-        msg: "Deployment={{ deployment_name }} current={{ current_cpu_limit_raw }} new={{ new_cpu_limit }}"
+        msg:
+          - "  CPU Limit : {{ current_cpu_raw }} → {{ new_cpu_limit }}"
+          - "  Replicas  : {{ current_replicas }} → {{ new_replicas }}"
+          - "  Strategy  : Vertical (CPU x1.5) + Horizontal (+1 replica)"
 
-    - name: Increase CPU limit by 1.5x on throttled deployment
+    # ─────────────────────────────────────────
+    # PHASE 3 — REMEDIATION
+    # ─────────────────────────────────────────
+
+    - name: "[PHASE 3] Patch deployment — increase CPU limit by 1.5x"
       kubernetes.core.k8s:
         validate_certs: false
-        state: patched
-        kind: Deployment
-        name: "{{ deployment_name }}"
-        namespace: "{{ app_namespace }}"
+        state: present
         definition:
+          apiVersion: apps/v1
+          kind: Deployment
           metadata:
+            name: "{{ deployment_name }}"
+            namespace: "{{ app_namespace }}"
             annotations:
-              remediation/cpu-limit-increased-at: "{{ ansible_date_time.iso8601 }}"
+              remediation/action: "cpu-throttling-relief"
+              remediation/triggered-by: "RF-02-PREFAS"
+              remediation/timestamp: "{{ ansible_date_time.iso8601 }}"
+              remediation/previous-cpu-limit: "{{ current_cpu_raw }}"
+              remediation/new-cpu-limit: "{{ new_cpu_limit }}"
           spec:
             template:
               spec:
@@ -101,6 +105,125 @@
                       limits:
                         cpu: "{{ new_cpu_limit }}"
 
-    - name: Log remediation complete
+    - name: "[PHASE 3] Scale up replicas by 1 (horizontal scaling)"
+      kubernetes.core.k8s_scale:
+        api_version: apps/v1
+        kind: Deployment
+        name: "{{ deployment_name }}"
+        namespace: "{{ app_namespace }}"
+        replicas: "{{ new_replicas }}"
+        validate_certs: false
+
+    - name: "[PHASE 3] Annotate scale event"
+      kubernetes.core.k8s:
+        state: present
+        validate_certs: false
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: "{{ deployment_name }}"
+            namespace: "{{ app_namespace }}"
+            annotations:
+              remediation/replicas-scaled-at: "{{ ansible_date_time.iso8601 }}"
+              remediation/previous-replicas: "{{ current_replicas | string }}"
+              remediation/new-replicas: "{{ new_replicas | string }}"
+
+    # ─────────────────────────────────────────
+    # PHASE 4 — VERIFICATION
+    # ─────────────────────────────────────────
+
+    - name: "[PHASE 4] Wait for deployment rollout to complete"
+      kubernetes.core.k8s_info:
+        kind: Deployment
+        name: "{{ deployment_name }}"
+        namespace: "{{ app_namespace }}"
+        validate_certs: false
+      register: rollout_status
+      until: >-
+        rollout_status.resources[0].status.readyReplicas is defined and
+        rollout_status.resources[0].status.readyReplicas ==
+        rollout_status.resources[0].spec.replicas
+      retries: 18
+      delay: 10
+
+    - name: "[PHASE 4] Verify rollout succeeded"
+      fail:
+        msg: "Rollout did not complete within timeout. Manual inspection required."
+      when: >-
+        rollout_status.resources[0].status.readyReplicas is not defined or
+        rollout_status.resources[0].status.readyReplicas !=
+        rollout_status.resources[0].spec.replicas
+
+    # ─────────────────────────────────────────
+    # PHASE 5 — NOTIFICATION
+    # ─────────────────────────────────────────
+
+    - name: "[PHASE 5] Write email body to temp file"
+      copy:
+        dest: /tmp/cpu_email_body.txt
+        content: |
+          RF-02 Autonomous Remediation Platform — Alert
+
+          Severity    : CRITICAL
+          Scenario    : S2 — CPU Throttling Detection & Remediation
+          Time        : {{ ansible_date_time.iso8601 }}
+
+          AFFECTED SERVICE
+          ─────────────────────────────────────────────────────
+          Namespace   : {{ app_namespace }}
+          Pod         : {{ throttled_pod }}
+          Container   : {{ throttled_container }}
+          Deployment  : {{ deployment_name }}
+
+          REMEDIATION APPLIED
+          ─────────────────────────────────────────────────────
+          Strategy    : Vertical + Horizontal scaling
+          CPU Limit   : {{ current_cpu_raw }} → {{ new_cpu_limit }}
+          Replicas    : {{ current_replicas }} → {{ new_replicas }}
+          Reason      : CPU throttled >60% of scheduling periods for 2+ minutes.
+                        Increasing CPU budget and distributing load across more pods.
+
+          OUTCOME
+          ─────────────────────────────────────────────────────
+          ✅ Deployment rollout completed successfully.
+          All pods are healthy and ready.
+
+          ──────────────────────────────────────────────────────
+          This action was performed automatically by RF-02.
+          No manual intervention was required.
+          ──────────────────────────────────────────────────────
+      no_log: true
+
+    - name: "[PHASE 5] Write email send script"
+      copy:
+        dest: /tmp/cpu_send_email.py
+        content: |
+          import smtplib
+          from email.mime.text import MIMEText
+          body = open('/tmp/cpu_email_body.txt').read()
+          msg = MIMEText(body)
+          msg['Subject'] = '[RF-02] CPU Throttling Remediated — {{ deployment_name }}'
+          msg['From'] = '{{ smtp_user }}'
+          msg['To'] = '{{ smtp_user }}'
+          s = smtplib.SMTP('smtp.gmail.com', 587)
+          s.starttls()
+          s.login('{{ smtp_user }}', '{{ smtp_password }}')
+          s.sendmail('{{ smtp_user }}', '{{ smtp_user }}', msg.as_string())
+          s.quit()
+          print('Email sent successfully')
+      no_log: true
+
+    - name: "[PHASE 5] Send remediation email"
+      command: python3 /tmp/cpu_send_email.py
+
+    - name: "[PHASE 5] Final summary log"
       debug:
-        msg: "CPU limit increased from {{ current_cpu_limit_raw }} to {{ new_cpu_limit }} on {{ deployment_name }}/{{ throttled_container }}"
+        msg:
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - "  ✅ Remediation COMPLETE"
+          - "  Deployment : {{ deployment_name }}"
+          - "  CPU Limit  : {{ current_cpu_raw }} → {{ new_cpu_limit }}"
+          - "  Replicas   : {{ current_replicas }} → {{ new_replicas }}"
+          - "  Email      : sent to {{ smtp_user }}"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

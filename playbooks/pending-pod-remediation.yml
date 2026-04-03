@@ -75,11 +75,17 @@
 
     - name: "[PHASE 3] Detect cause — affinity or resource exhaustion"
       set_fact:
+        # Check for resource issues (prioritized)
+        has_resource_issue: >-
+          {{ pod_events | select('search', 'Insufficient') | list | length > 0
+             or pod_events | select('search', 'insufficient') | list | length > 0 }}
+        
+        # Check for affinity/selector issues (only if no resource issue)
         has_affinity_issue: >-
-          {{ pod_events | select('search', 'affinity') | list | length > 0
-             or pod_events | select('search', 'selector') | list | length > 0
-             or pod_events | select('search', 'taint') | list | length > 0
-             or pod_events | select('search', 'toleration') | list | length > 0 }}
+          {{ not has_resource_issue
+             and (pod_events | select('search', 'affinity/selector') | list | length > 0
+                  or pod_events | select('search', 'node affinity') | list | length > 0
+                  or pod_events | select('search', 'node selector') | list | length > 0) }}
       when: remediation_type == "pending-pod-unschedulable"
 
 

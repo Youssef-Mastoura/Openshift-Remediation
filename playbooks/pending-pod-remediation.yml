@@ -1,31 +1,45 @@
 ---
-- name: S7 - Pending Pod Remediation (3 causes)
+- name: S7 — Pending Pod Remediation (3 causes)
   hosts: localhost
   connection: local
   gather_facts: true
+
   vars:
     app_namespace: ms-demo
 
   tasks:
 
-    - name: Extract alert info from event
+    # ─────────────────────────────────────────
+    # PHASE 1 — EVENT PARSING
+    # ─────────────────────────────────────────
+
+    - name: "[PHASE 1] Extract alert context from EDA event"
       set_fact:
         alert_pod: "{{ event.payload.alerts[0].labels.pod }}"
         remediation_type: "{{ event.payload.alerts[0].labels.remediation }}"
+        alert_namespace: "{{ event.payload.alerts[0].labels.namespace }}"
 
-    - name: Log remediation start
-      debug:
-        msg: "Pending pod alert fired — pod={{ alert_pod }} cause={{ remediation_type }}"
-
-    - name: Derive deployment name from pod name
+    - name: "[PHASE 1] Derive deployment name from pod name"
       set_fact:
         deployment_name: "{{ alert_pod | regex_replace('-[a-z0-9]+-[a-z0-9]+$', '') }}"
 
-    - name: Log derived deployment name
+    - name: "[PHASE 1] Log remediation start"
       debug:
-        msg: "Derived deployment name: {{ deployment_name }}"
+        msg:
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - "  RF-02 | Pending Pod Remediation Initiated"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - "  Pod         : {{ alert_pod }}"
+          - "  Deployment  : {{ deployment_name }}"
+          - "  Cause       : {{ remediation_type }}"
+          - "  Namespace   : {{ alert_namespace }}"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-    - name: Get Deployment info
+    # ─────────────────────────────────────────
+    # PHASE 2 — DISCOVERY
+    # ─────────────────────────────────────────
+
+    - name: "[PHASE 2] Get Deployment info"
       kubernetes.core.k8s_info:
         kind: Deployment
         name: "{{ deployment_name }}"
@@ -33,11 +47,16 @@
         validate_certs: false
       register: deployment_info
 
-    # ─────────────────────────────────────────────
-    # CAUSE DETECTION — Read scheduler events
-    # ─────────────────────────────────────────────
+    - name: "[PHASE 2] Abort if deployment not found"
+      fail:
+        msg: "Deployment '{{ deployment_name }}' not found. Aborting."
+      when: deployment_info.resources | length == 0
 
-    - name: Get all events in namespace
+    # ─────────────────────────────────────────
+    # PHASE 3 — CAUSE DETECTION (unschedulable only)
+    # ─────────────────────────────────────────
+
+    - name: "[PHASE 3] Get FailedScheduling events for this pod"
       kubernetes.core.k8s_info:
         kind: Event
         namespace: "{{ app_namespace }}"
@@ -45,7 +64,7 @@
       register: all_events
       when: remediation_type == "pending-pod-unschedulable"
 
-    - name: Filter FailedScheduling events for this pod
+    - name: "[PHASE 3] Filter FailedScheduling events for this pod"
       set_fact:
         pod_events: >-
           {{ all_events.resources
@@ -54,22 +73,26 @@
              | map(attribute='message') | list }}
       when: remediation_type == "pending-pod-unschedulable"
 
-    - name: Detect cause from scheduler message
+    - name: "[PHASE 3] Detect cause — affinity or resource exhaustion"
       set_fact:
         has_affinity_issue: >-
-          {{ pod_events | select('search', 'affinity|selector') | list | length > 0 }}
+          {{ pod_events | select('search', 'affinity|selector|taint|toleration') | list | length > 0 }}
       when: remediation_type == "pending-pod-unschedulable"
 
-    - name: Log cause detection result
+    - name: "[PHASE 3] Log cause detection"
       debug:
-        msg: "affinity_issue={{ has_affinity_issue }} | events={{ pod_events }}"
+        msg:
+          - "  Events found : {{ pod_events | length }}"
+          - "  Affinity     : {{ has_affinity_issue | default(false) }}"
+          - "  Cause        : {{ 'Node Affinity/Selector Mismatch' if has_affinity_issue | default(false) | bool else 'Insufficient Node Resources' }}"
       when: remediation_type == "pending-pod-unschedulable"
 
-    # ─────────────────────────────────────────────
-    # CAUSE 2 — Node Affinity/Selector Mismatch
-    # ─────────────────────────────────────────────
+    # ─────────────────────────────────────────
+    # PHASE 4 — REMEDIATION
+    # ─────────────────────────────────────────
 
-    - name: "[Affinity] Remove nodeSelector and affinity from deployment"
+    # --- CAUSE 2: Node Affinity/Selector Mismatch ---
+    - name: "[PHASE 4 — Affinity] Remove nodeSelector and affinity"
       kubernetes.core.k8s:
         state: present
         validate_certs: false
@@ -80,7 +103,9 @@
             name: "{{ deployment_name }}"
             namespace: "{{ app_namespace }}"
             annotations:
-              remediation/affinity-removed-at: "{{ ansible_date_time.iso8601 }}"
+              remediation/action: "affinity-removed"
+              remediation/triggered-by: "RF-02-PREFAS"
+              remediation/timestamp: "{{ ansible_date_time.iso8601 }}"
           spec:
             template:
               spec:
@@ -88,20 +113,17 @@
                 affinity: null
       when:
         - remediation_type == "pending-pod-unschedulable"
-        - has_affinity_issue | bool
+        - has_affinity_issue | default(false) | bool
 
-    - name: "[Affinity] Log fix applied"
+    - name: "[PHASE 4 — Affinity] Log fix applied"
       debug:
-        msg: "Removed nodeSelector/affinity from {{ deployment_name }}"
+        msg: "Removed nodeSelector/affinity from {{ deployment_name }} — pod should schedule now"
       when:
         - remediation_type == "pending-pod-unschedulable"
-        - has_affinity_issue | bool
+        - has_affinity_issue | default(false) | bool
 
-    # ─────────────────────────────────────────────
-    # CAUSE 1 — Insufficient Resources
-    # ─────────────────────────────────────────────
-
-    - name: "[Resources] Extract container name and current requests"
+    # --- CAUSE 1: Insufficient Resources ---
+    - name: "[PHASE 4 — Resources] Extract container name and current requests"
       set_fact:
         container_name: >-
           {{ deployment_info.resources[0].spec.template.spec.containers[0].name }}
@@ -113,40 +135,40 @@
              .resources.requests.memory | default('128Mi') }}
       when:
         - remediation_type == "pending-pod-unschedulable"
-        - not (has_affinity_issue | bool)
+        - not (has_affinity_issue | default(false) | bool)
 
-    - name: "[Resources] Convert CPU request to millicores"
+    - name: "[PHASE 4 — Resources] Convert CPU request to millicores"
       set_fact:
         cpu_millicores: "{{ current_cpu_request | regex_replace('m', '') | int }}"
       when:
         - remediation_type == "pending-pod-unschedulable"
-        - not (has_affinity_issue | bool)
+        - not (has_affinity_issue | default(false) | bool)
 
-    - name: "[Resources] Convert memory request to Mi"
+    - name: "[PHASE 4 — Resources] Convert memory request to Mi"
       set_fact:
         mem_mi: "{{ current_mem_request | regex_replace('Mi', '') | int }}"
       when:
         - remediation_type == "pending-pod-unschedulable"
-        - not (has_affinity_issue | bool)
+        - not (has_affinity_issue | default(false) | bool)
 
-    - name: "[Resources] Compute reduced requests (×0.75)"
+    - name: "[PHASE 4 — Resources] Compute reduced requests (x0.75)"
       set_fact:
         new_cpu_request: "{{ (cpu_millicores | int * 0.75) | int }}m"
         new_mem_request: "{{ (mem_mi | int * 0.75) | int }}Mi"
       when:
         - remediation_type == "pending-pod-unschedulable"
-        - not (has_affinity_issue | bool)
+        - not (has_affinity_issue | default(false) | bool)
 
-    - name: "[Resources] Log current and new resource requests"
+    - name: "[PHASE 4 — Resources] Log resource reduction plan"
       debug:
-        msg: >
-          CPU: {{ current_cpu_request }} → {{ new_cpu_request }}
-          | Memory: {{ current_mem_request }} → {{ new_mem_request }}
+        msg:
+          - "  CPU  : {{ current_cpu_request }} → {{ new_cpu_request }}"
+          - "  Memory: {{ current_mem_request }} → {{ new_mem_request }}"
       when:
         - remediation_type == "pending-pod-unschedulable"
-        - not (has_affinity_issue | bool)
+        - not (has_affinity_issue | default(false) | bool)
 
-    - name: "[Resources] Patch deployment with reduced resource requests"
+    - name: "[PHASE 4 — Resources] Patch deployment with reduced resource requests"
       kubernetes.core.k8s:
         state: present
         validate_certs: false
@@ -157,9 +179,13 @@
             name: "{{ deployment_name }}"
             namespace: "{{ app_namespace }}"
             annotations:
-              remediation/resources-reduced-at: "{{ ansible_date_time.iso8601 }}"
+              remediation/action: "resource-requests-reduced"
+              remediation/triggered-by: "RF-02-PREFAS"
+              remediation/timestamp: "{{ ansible_date_time.iso8601 }}"
               remediation/previous-cpu-request: "{{ current_cpu_request }}"
               remediation/new-cpu-request: "{{ new_cpu_request }}"
+              remediation/previous-mem-request: "{{ current_mem_request }}"
+              remediation/new-mem-request: "{{ new_mem_request }}"
           spec:
             template:
               spec:
@@ -171,13 +197,10 @@
                         memory: "{{ new_mem_request }}"
       when:
         - remediation_type == "pending-pod-unschedulable"
-        - not (has_affinity_issue | bool)
+        - not (has_affinity_issue | default(false) | bool)
 
-    # ─────────────────────────────────────────────
-    # CAUSE 3 — PVC Not Bound
-    # ─────────────────────────────────────────────
-
-    - name: "[PVC] Find all PVCs in namespace"
+    # --- CAUSE 3: PVC Not Bound ---
+    - name: "[PHASE 4 — PVC] Find all PVCs in namespace"
       kubernetes.core.k8s_info:
         kind: PersistentVolumeClaim
         namespace: "{{ app_namespace }}"
@@ -185,18 +208,26 @@
       register: all_pvcs
       when: remediation_type == "pending-pod-pvc"
 
-    - name: "[PVC] Filter pending PVCs"
+    - name: "[PHASE 4 — PVC] Filter pending PVCs"
       set_fact:
         pending_pvcs: >-
-          {{ all_pvcs.resources | selectattr('status.phase', '==', 'Pending') | list }}
+          {{ all_pvcs.resources
+             | selectattr('status.phase', '==', 'Pending') | list }}
       when: remediation_type == "pending-pod-pvc"
 
-    - name: "[PVC] Log pending PVCs found"
+    - name: "[PHASE 4 — PVC] Log pending PVCs found"
       debug:
         msg: "Found {{ pending_pvcs | length }} pending PVC(s): {{ pending_pvcs | map(attribute='metadata.name') | list }}"
       when: remediation_type == "pending-pod-pvc"
 
-    - name: "[PVC] Create matching hostPath PV for each pending PVC"
+    - name: "[PHASE 4 — PVC] Fail gracefully if no pending PVCs found"
+      fail:
+        msg: "No pending PVCs found in namespace {{ app_namespace }}. Cannot remediate."
+      when:
+        - remediation_type == "pending-pod-pvc"
+        - pending_pvcs | length == 0
+
+    - name: "[PHASE 4 — PVC] Create matching hostPath PV for each pending PVC"
       kubernetes.core.k8s:
         state: present
         validate_certs: false
@@ -207,6 +238,7 @@
             name: "remediation-pv-{{ item.metadata.name }}"
             annotations:
               remediation/created-at: "{{ ansible_date_time.iso8601 }}"
+              remediation/triggered-by: "RF-02-PREFAS"
               remediation/for-pvc: "{{ item.metadata.name }}"
           spec:
             capacity:
@@ -222,7 +254,7 @@
         - remediation_type == "pending-pod-pvc"
         - pending_pvcs | length > 0
 
-    - name: "[PVC] Wait for PVC to bind"
+    - name: "[PHASE 4 — PVC] Wait for PVC to bind"
       kubernetes.core.k8s_info:
         kind: PersistentVolumeClaim
         name: "{{ item.metadata.name }}"
@@ -237,19 +269,19 @@
         - remediation_type == "pending-pod-pvc"
         - pending_pvcs | length > 0
 
-    - name: "[PVC] Log PVC bound successfully"
+    - name: "[PHASE 4 — PVC] Log PVC bound successfully"
       debug:
-        msg: "PVC {{ item.metadata.name }} is now Bound to PV remediation-pv-{{ item.metadata.name }}"
+        msg: "PVC {{ item.metadata.name }} → Bound to PV remediation-pv-{{ item.metadata.name }}"
       loop: "{{ pending_pvcs }}"
       when:
         - remediation_type == "pending-pod-pvc"
         - pending_pvcs | length > 0
 
-    # ─────────────────────────────────────────────
-    # FINAL — Wait and Report
-    # ─────────────────────────────────────────────
+    # ─────────────────────────────────────────
+    # PHASE 5 — VERIFICATION
+    # ─────────────────────────────────────────
 
-    - name: Wait for deployment rollout to complete
+    - name: "[PHASE 5] Wait for deployment rollout to complete"
       kubernetes.core.k8s_info:
         kind: Deployment
         name: "{{ deployment_name }}"
@@ -263,9 +295,85 @@
       retries: 12
       delay: 10
 
-    - name: Report remediation complete
+    - name: "[PHASE 5] Log rollout status"
       debug:
-        msg: >
-          S7 remediation complete for {{ deployment_name }}
-          | cause: {{ remediation_type }}
-          | namespace: {{ app_namespace }}
+        msg: "Rollout complete for {{ deployment_name }} — readyReplicas={{ rollout_status.resources[0].status.readyReplicas }}"
+
+    # ─────────────────────────────────────────
+    # PHASE 6 — NOTIFICATION
+    # ─────────────────────────────────────────
+
+    - name: "[PHASE 6] Write email body to temp file"
+      copy:
+        dest: /tmp/pending_email_body.txt
+        content: |
+          RF-02 Autonomous Remediation Platform — Alert
+
+          Severity    : CRITICAL
+          Scenario    : S7 — Pending Pod Detection & Remediation
+          Time        : {{ ansible_date_time.iso8601 }}
+
+          AFFECTED SERVICE
+          ─────────────────────────────────────────────────────
+          Namespace   : {{ app_namespace }}
+          Pod         : {{ alert_pod }}
+          Deployment  : {{ deployment_name }}
+          Cause Type  : {{ remediation_type }}
+
+          REMEDIATION APPLIED
+          ─────────────────────────────────────────────────────
+          {% if remediation_type == "pending-pod-pvc" %}
+          Action      : Created hostPath PV to bind pending PVC
+          PVCs Fixed  : {{ pending_pvcs | map(attribute='metadata.name') | list | join(', ') }}
+          {% elif has_affinity_issue | default(false) | bool %}
+          Action      : Removed nodeSelector and affinity constraints
+          Reason      : No node matched the scheduling requirements
+          {% else %}
+          Action      : Reduced resource requests by 25% (x0.75)
+          CPU         : {{ current_cpu_request }} → {{ new_cpu_request }}
+          Memory      : {{ current_mem_request }} → {{ new_mem_request }}
+          Reason      : Insufficient node resources to schedule pod
+          {% endif %}
+
+          OUTCOME
+          ─────────────────────────────────────────────────────
+          ✅ Deployment rollout completed successfully.
+          Pod is now Running and Ready.
+
+          ──────────────────────────────────────────────────────
+          This action was performed automatically by RF-02.
+          No manual intervention was required.
+          ──────────────────────────────────────────────────────
+      no_log: true
+
+    - name: "[PHASE 6] Write email send script"
+      copy:
+        dest: /tmp/pending_send_email.py
+        content: |
+          import smtplib
+          from email.mime.text import MIMEText
+          body = open('/tmp/pending_email_body.txt').read()
+          msg = MIMEText(body)
+          msg['Subject'] = '[RF-02] Pending Pod Remediated — {{ deployment_name }} ({{ remediation_type }})'
+          msg['From'] = '{{ smtp_user }}'
+          msg['To'] = '{{ smtp_user }}'
+          s = smtplib.SMTP('smtp.gmail.com', 587)
+          s.starttls()
+          s.login('{{ smtp_user }}', '{{ smtp_password }}')
+          s.sendmail('{{ smtp_user }}', '{{ smtp_user }}', msg.as_string())
+          s.quit()
+          print('Email sent successfully')
+      no_log: true
+
+    - name: "[PHASE 6] Send remediation email"
+      command: python3 /tmp/pending_send_email.py
+
+    - name: "[PHASE 6] Final summary log"
+      debug:
+        msg:
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - "  ✅ Remediation COMPLETE"
+          - "  Deployment  : {{ deployment_name }}"
+          - "  Cause       : {{ remediation_type }}"
+          - "  Email       : sent to {{ smtp_user }}"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

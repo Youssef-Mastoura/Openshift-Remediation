@@ -73,28 +73,29 @@
              | map(attribute='message') | list }}
       when: remediation_type == "pending-pod-unschedulable"
 
-    - name: "[PHASE 3] Detect cause — affinity or resource exhaustion"
+    - name: "[PHASE 3] Check for resource insufficiency"
       set_fact:
-        # Check for resource issues (prioritized)
         has_resource_issue: >-
           {{ pod_events | select('search', 'Insufficient') | list | length > 0
              or pod_events | select('search', 'insufficient') | list | length > 0 }}
-        
-        # Check for affinity/selector issues (only if no resource issue)
+      when: remediation_type == "pending-pod-unschedulable"
+
+    - name: "[PHASE 3] Check for affinity/selector mismatch"
+      set_fact:
         has_affinity_issue: >-
-          {{ not has_resource_issue
+          {{ not has_resource_issue | default(false)
              and (pod_events | select('search', 'affinity/selector') | list | length > 0
                   or pod_events | select('search', 'node affinity') | list | length > 0
                   or pod_events | select('search', 'node selector') | list | length > 0) }}
       when: remediation_type == "pending-pod-unschedulable"
 
-
     - name: "[PHASE 3] Log cause detection"
       debug:
         msg:
           - "  Events found : {{ pod_events | length }}"
-          - "  Affinity     : {{ has_affinity_issue | default(false) }}"
-          - "  Cause        : {{ 'Node Affinity/Selector Mismatch' if has_affinity_issue | default(false) | bool else 'Insufficient Node Resources' }}"
+          - "  Resource issue: {{ has_resource_issue | default(false) }}"
+          - "  Affinity issue: {{ has_affinity_issue | default(false) }}"
+          - "  Cause        : {{ 'Node Affinity/Selector Mismatch' if (has_affinity_issue | default(false)) else 'Insufficient Node Resources' }}"
       when: remediation_type == "pending-pod-unschedulable"
 
     # ─────────────────────────────────────────

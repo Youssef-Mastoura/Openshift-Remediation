@@ -73,29 +73,41 @@
              | map(attribute='message') | list }}
       when: remediation_type == "pending-pod-unschedulable"
 
+    - name: "[PHASE 3] DEBUG - Show raw event messages"
+      debug:
+        msg: "Raw events: {{ pod_events }}"
+      when: remediation_type == "pending-pod-unschedulable"
+
     - name: "[PHASE 3] Check for resource insufficiency"
       set_fact:
         has_resource_issue: >-
-          {{ pod_events | select('search', 'Insufficient') | list | length > 0
-             or pod_events | select('search', 'insufficient') | list | length > 0 }}
+          {{ pod_events | select('regex', 'Insufficient') | list | length > 0 }}
       when: remediation_type == "pending-pod-unschedulable"
 
-    - name: "[PHASE 3] Check for affinity/selector mismatch"
+    - name: "[PHASE 3] Check for affinity mismatch"
       set_fact:
         has_affinity_issue: >-
-          {{ not has_resource_issue | default(false)
-             and (pod_events | select('search', 'affinity/selector') | list | length > 0
-                  or pod_events | select('search', 'node affinity') | list | length > 0
-                  or pod_events | select('search', 'node selector') | list | length > 0) }}
-      when: remediation_type == "pending-pod-unschedulable"
+          {{ pod_events | select('search', "didn't match Pod's node affinity") | list | length > 0
+             or pod_events | select('search', "affinity/selector") | list | length > 0 }}
+      when: 
+        - remediation_type == "pending-pod-unschedulable"
+        - not (has_resource_issue | default(false))
+
+    - name: "[PHASE 3] Set default if neither detected"
+      set_fact:
+        has_affinity_issue: false
+      when: 
+        - remediation_type == "pending-pod-unschedulable"
+        - has_affinity_issue is not defined
+        - not (has_resource_issue | default(false))
 
     - name: "[PHASE 3] Log cause detection"
       debug:
         msg:
-          - "  Events found : {{ pod_events | length }}"
-          - "  Resource issue: {{ has_resource_issue | default(false) }}"
-          - "  Affinity issue: {{ has_affinity_issue | default(false) }}"
-          - "  Cause        : {{ 'Node Affinity/Selector Mismatch' if (has_affinity_issue | default(false)) else 'Insufficient Node Resources' }}"
+          - "  Events found     : {{ pod_events | length }}"
+          - "  Resource issue   : {{ has_resource_issue | default(false) }}"
+          - "  Affinity issue   : {{ has_affinity_issue | default(false) }}"
+          - "  Final cause      : {{ 'Node Affinity/Selector Mismatch' if (has_affinity_issue | default(false)) else 'Insufficient Node Resources' }}"
       when: remediation_type == "pending-pod-unschedulable"
 
     # ─────────────────────────────────────────

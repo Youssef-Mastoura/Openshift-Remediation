@@ -76,8 +76,12 @@
     - name: "[PHASE 3] Detect cause — affinity or resource exhaustion"
       set_fact:
         has_affinity_issue: >-
-          {{ pod_events | select('search', 'affinity|selector|taint|toleration') | list | length > 0 }}
+          {{ pod_events | select('search', 'affinity') | list | length > 0
+             or pod_events | select('search', 'selector') | list | length > 0
+             or pod_events | select('search', 'taint') | list | length > 0
+             or pod_events | select('search', 'toleration') | list | length > 0 }}
       when: remediation_type == "pending-pod-unschedulable"
+
 
     - name: "[PHASE 3] Log cause detection"
       debug:

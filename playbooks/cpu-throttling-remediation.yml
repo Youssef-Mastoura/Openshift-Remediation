@@ -131,6 +131,10 @@
         rollout_status.resources[0].status.readyReplicas !=
         rollout_status.resources[0].spec.replicas
 
+    - name: "[PHASE 4] Wait for rollout to fully settle before scaling"
+      pause:
+        seconds: 15
+
     - name: "[PHASE 4] Scale up replicas by 1 (horizontal scaling)"
       kubernetes.core.k8s_scale:
         api_version: apps/v1
@@ -139,6 +143,8 @@
         namespace: "{{ app_namespace }}"
         replicas: "{{ new_replicas }}"
         validate_certs: false
+        wait: true
+        wait_timeout: 120
 
     - name: "[PHASE 4] Annotate scale event"
       kubernetes.core.k8s:

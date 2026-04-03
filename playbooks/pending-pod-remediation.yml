@@ -73,23 +73,139 @@
              | map(attribute='message') | list }}
       when: remediation_type == "pending-pod-unschedulable"
 
-    - name: "[PHASE 3] Detect cause — affinity or resource exhaustion"
+    - name: "[PHASE 3] Check exact affinity/selector patterns"
       set_fact:
-        has_affinity_issue: >-
-          {{ pod_events | select('search', 'affinity') | list | length > 0
-             or pod_events | select('search', 'selector') | list | length > 0
-             or pod_events | select('search', 'taint') | list | length > 0
-             or pod_events | select('search', 'toleration') | list | length > 0 }}
-      when: remediation_type == "pending-pod-unschedulable"
+        has_affinity_issue: true
+        detected_cause: "Node Affinity/Selector Mismatch"
+        cause_confidence: "High"
+      when:
+        - remediation_type == "pending-pod-unschedulable"
+        - pod_events | length > 0
+        - >
+            (pod_events | select('search', 'did not match pod affinity') | list | length > 0) or
+            (pod_events | select('search', 'did not match node selector') | list | length > 0) or
+            (pod_events | select('search', 'did not match .* affinity') | list | length > 0) or
+            (pod_events | select('search', 'no nodes available to schedule pods with selector') | list | length > 0)
 
+    - name: "[PHASE 3] Check taint/toleration patterns"
+      set_fact:
+        has_affinity_issue: true
+        detected_cause: "Node Taint/Toleration Mismatch"
+        cause_confidence: "High"
+      when:
+        - remediation_type == "pending-pod-unschedulable"
+        - pod_events | length > 0
+        - has_affinity_issue is not defined
+        - >
+            (pod_events | select('search', 'did not tolerate taint') | list | length > 0) or
+            (pod_events | select('search', 'taint') | list | length > 0 and
+             pod_events | select('search', 'toleration') | list | length == 0)
 
-    - name: "[PHASE 3] Log cause detection"
+    - name: "[PHASE 3] Get node capacity for resource verification"
+      kubernetes.core.k8s_info:
+        kind: Node
+        validate_certs: false
+      register: all_nodes
+      when:
+        - remediation_type == "pending-pod-unschedulable"
+        - has_affinity_issue is not defined
+
+    - name: "[PHASE 3] Extract pod resource requests"
+      set_fact:
+        pod_cpu_request: >-
+          {{ deployment_info.resources[0].spec.template.spec.containers[0]
+             .resources.requests.cpu | default('100m') | regex_replace('m', '') | int }}
+        pod_mem_request: >-
+          {{ deployment_info.resources[0].spec.template.spec.containers[0]
+             .resources.requests.memory | default('128Mi') | regex_replace('Mi', '') | int }}
+      when:
+        - remediation_type == "pending-pod-unschedulable"
+        - has_affinity_issue is not defined
+
+    - name: "[PHASE 3] Calculate cluster resource pressure"
+      set_fact:
+        cluster_resource_pressure: >-
+          {%- set ns = namespace(cpu_pressure=false, mem_pressure=false, highest_cpu=0, highest_mem=0) -%}
+          {%- for node in all_nodes.resources -%}
+            {%- set allocatable_cpu = node.status.allocatable.cpu | regex_replace('m', '') | int -%}
+            {%- set allocatable_mem = node.status.allocatable.memory | regex_replace('Ki', '') | int -%}
+            {%- if allocatable_cpu > ns.highest_cpu -%}
+              {%- set ns.highest_cpu = allocatable_cpu -%}
+            {%- endif -%}
+            {%- if allocatable_mem > ns.highest_mem -%}
+              {%- set ns.highest_mem = allocatable_mem -%}
+            {%- endif -%}
+            {%- if allocatable_cpu < pod_cpu_request -%}
+              {%- set ns.cpu_pressure = true -%}
+            {%- endif -%}
+            {%- if allocatable_mem < pod_mem_request -%}
+              {%- set ns.mem_pressure = true -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ {
+            'cpu_pressure': ns.cpu_pressure,
+            'mem_pressure': ns.mem_pressure,
+            'largest_cpu': ns.highest_cpu,
+            'largest_mem': ns.highest_mem,
+            'pod_cpu': pod_cpu_request,
+            'pod_mem': pod_mem_request
+          } }}
+      when:
+        - remediation_type == "pending-pod-unschedulable"
+        - has_affinity_issue is not defined
+
+    - name: "[PHASE 3] Determine resource insufficiency cause"
+      set_fact:
+        has_affinity_issue: false
+        detected_cause: >-
+          {%- if cluster_resource_pressure.cpu_pressure and cluster_resource_pressure.mem_pressure -%}
+            Insufficient CPU and Memory Resources
+          {%- elif cluster_resource_pressure.cpu_pressure -%}
+            Insufficient CPU Resources
+          {%- elif cluster_resource_pressure.mem_pressure -%}
+            Insufficient Memory Resources
+          {%- else -%}
+            Unknown Scheduling Constraint
+          {%- endif -%}
+        cause_confidence: >-
+          {%- if cluster_resource_pressure.cpu_pressure or cluster_resource_pressure.mem_pressure -%}
+            High
+          {%- else -%}
+            Low
+          {%- endif -%}
+      when:
+        - remediation_type == "pending-pod-unschedulable"
+        - has_affinity_issue is not defined
+        - cluster_resource_pressure.cpu_pressure or cluster_resource_pressure.mem_pressure
+
+    - name: "[PHASE 3] Set unknown cause with raw events for debugging"
+      set_fact:
+        has_affinity_issue: false
+        detected_cause: "Unknown Scheduling Constraint (check raw events)"
+        cause_confidence: "Low"
+      when:
+        - remediation_type == "pending-pod-unschedulable"
+        - has_affinity_issue is not defined
+
+    - name: "[PHASE 3] Log cause detection with confidence"
       debug:
         msg:
-          - "  Events found : {{ pod_events | length }}"
-          - "  Affinity     : {{ has_affinity_issue | default(false) }}"
-          - "  Cause        : {{ 'Node Affinity/Selector Mismatch' if has_affinity_issue | default(false) | bool else 'Insufficient Node Resources' }}"
+          - "  Events found     : {{ pod_events | length }}"
+          - "  Detected cause   : {{ detected_cause | default('Unknown') }}"
+          - "  Confidence       : {{ cause_confidence | default('Unknown') }}"
+          - "  Is Affinity Issue: {{ has_affinity_issue | default(false) }}"
+          - "  Pod requests     : CPU={{ pod_cpu_request | default('N/A') }}m, Memory={{ pod_mem_request | default('N/A') }}Mi"
+          - "  Largest node     : CPU={{ cluster_resource_pressure.largest_cpu | default('N/A') }}m, Memory={{ cluster_resource_pressure.largest_mem | default('N/A') }}Mi"
       when: remediation_type == "pending-pod-unschedulable"
+
+    - name: "[PHASE 3] Log raw events for low confidence cases"
+      debug:
+        msg:
+          - "  Raw events for debugging:"
+          - "    {{ pod_events[0:3] | to_nice_json }}"
+      when:
+        - remediation_type == "pending-pod-unschedulable"
+        - cause_confidence | default('High') == "Low"
 
     # ─────────────────────────────────────────
     # PHASE 4 — REMEDIATION

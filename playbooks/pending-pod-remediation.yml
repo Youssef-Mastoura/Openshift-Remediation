@@ -78,29 +78,29 @@
         msg: "Raw events: {{ pod_events }}"
       when: remediation_type == "pending-pod-unschedulable"
 
-    - name: "[PHASE 3] Detect cause — resource or affinity"
+    - name: "[PHASE 3] Build combined event text"
       set_fact:
-        has_resource_issue: >-
-          {{ pod_events | join(' ') is search('Insufficient') }}
-        has_affinity_issue: >-
-          {{ pod_events | join(' ') is search('affinity') or
-             pod_events | join(' ') is search('selector') }}
+        combined_events: "{{ pod_events | join(' ') }}"
       when: remediation_type == "pending-pod-unschedulable"
 
-    - name: "[PHASE 3] Priority — resource takes precedence over affinity"
+    - name: "[PHASE 3] Detect resource insufficiency"
       set_fact:
-        has_affinity_issue: false
-      when:
-        - remediation_type == "pending-pod-unschedulable"
-        - has_resource_issue | bool
+        has_resource_issue: "{{ 'Insufficient' in combined_events }}"
+      when: remediation_type == "pending-pod-unschedulable"
+
+    - name: "[PHASE 3] Detect affinity mismatch"
+      set_fact:
+        has_affinity_issue: "{{ (\"didn't match\" in combined_events) and not has_resource_issue }}"
+      when: remediation_type == "pending-pod-unschedulable"
 
     - name: "[PHASE 3] Log cause detection"
       debug:
         msg:
           - "  Events found   : {{ pod_events | length }}"
-          - "  Resource issue : {{ has_resource_issue | default(false) }}"
-          - "  Affinity issue : {{ has_affinity_issue | default(false) }}"
-          - "  Final cause    : {{ 'Node Affinity/Selector Mismatch' if has_affinity_issue | default(false) | bool else 'Insufficient Node Resources' }}"
+          - "  Combined text  : {{ combined_events }}"
+          - "  Resource issue : {{ has_resource_issue }}"
+          - "  Affinity issue : {{ has_affinity_issue }}"
+          - "  Final cause    : {{ 'Affinity/Selector Mismatch' if has_affinity_issue else 'Insufficient Node Resources' }}"
       when: remediation_type == "pending-pod-unschedulable"
 
     # ─────────────────────────────────────────

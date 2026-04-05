@@ -146,6 +146,11 @@
         rollout_status.resources[0].status.readyReplicas !=
         rollout_status.resources[0].spec.replicas
 
+    - name: "[PHASE 4] Wait for rollout to fully settle before scaling"
+      pause:
+        seconds: 15
+      when: remediation_type == "increase-mem-recurring"
+
     - name: "[PHASE 4] Scale up replicas by 1 (recurring OOM only)"
       when: remediation_type == "increase-mem-recurring"
       kubernetes.core.k8s_scale:
@@ -155,6 +160,8 @@
         namespace: "{{ app_namespace }}"
         replicas: "{{ (current_replicas | int) + 1 }}"
         validate_certs: false
+        wait: true
+        wait_timeout: 120
 
     - name: "[PHASE 4] Annotate scale event (recurring OOM only)"
       when: remediation_type == "increase-mem-recurring"

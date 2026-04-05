@@ -52,7 +52,6 @@
         previous_image: >-
           {{ all_rs.resources
              | sort(attribute='metadata.creationTimestamp')
-             | reverse
              | selectattr('status.replicas', 'defined')
              | selectattr('status.replicas', 'equalto', 0)
              | map(attribute='spec.template.spec.containers')

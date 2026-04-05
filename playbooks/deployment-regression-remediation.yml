@@ -5,7 +5,7 @@
   gather_facts: true
   vars:
     app_namespace: ms-demo
-    regression_window_minutes: 5
+    regression_window_minutes: 10
   tasks:
 
     # ─────────────────────────────────────────

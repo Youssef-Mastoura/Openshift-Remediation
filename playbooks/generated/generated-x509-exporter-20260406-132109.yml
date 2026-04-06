@@ -1,0 +1,124 @@
+---
+- name: Resource Exhaustion Remediation
+  hosts: localhost
+  connection: local
+  gather_facts: true
+
+  vars:
+    app_namespace: "ms-demo"
+
+  tasks:
+    - name: Log remediation start
+      debug:
+        msg: "Resource exhaustion alert received — starting remediation"
+
+    - name: Extract pod and namespace from event
+      set_fact:
+        pod_name: "{{ event_data.pod }}"
+        namespace: "{{ event_data.namespace | default('ms-demo') }}"
+
+    - name: Log extracted values
+      debug:
+        msg: "Resource exhaustion on pod={{ pod_name }} namespace={{ namespace }}"
+
+    - name: Derive deployment name from pod name
+      set_fact:
+        deployment_name: "{{ pod_name | regex_replace('-[a-z0-9]+-[a-z0-9]+$', '') }}"
+
+    - name: Log derived deployment name
+      debug:
+        msg: "Derived deployment name: {{ deployment_name }}"
+
+    - name: Get Deployment info
+      kubernetes.core.k8s_info:
+        kind: Deployment
+        name: "{{ deployment_name }}"
+        namespace: "{{ namespace }}"
+        validate_certs: false
+      register: deployment_info
+
+    - name: Extract current replica count
+      set_fact:
+        current_replicas: "{{ deployment_info.resources[0].spec.replicas | int }}"
+
+    - name: Calculate new replica count (current x 1.5)
+      set_fact:
+        new_replicas: "{{ (current_replicas | int * 1.5) | int }}"
+
+    - name: Log deployment and replica values
+      debug:
+        msg: >-
+          Deployment={{ deployment_name }} current_replicas={{ current_replicas }} new_replicas={{ new_replicas }}
+
+    - name: Scale up replicas
+      kubernetes.core.k8s_scale:
+        api_version: apps/v1
+        kind: Deployment
+        name: "{{ deployment_name }}"
+        namespace: "{{ namespace }}"
+        replicas: "{{ new_replicas }}"
+        validate_certs: false
+
+    - name: Annotate replica scale
+      kubernetes.core.k8s:
+        state: present
+        validate_certs: false
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: "{{ deployment_name }}"
+            namespace: "{{ namespace }}"
+            annotations:
+              remediation/resource-exhaustion-replicas-scaled-at: "{{ ansible_date_time.iso8601 }}"
+              remediation/resource-exhaustion-previous-replicas: "{{ current_replicas | string }}"
+              remediation/resource-exhaustion-new-replicas: "{{ new_replicas | string }}"
+
+    - name: Wait for rollout to complete
+      kubernetes.core.k8s_info:
+        kind: Deployment
+        name: "{{ deployment_name }}"
+        namespace: "{{ namespace }}"
+        validate_certs: false
+      register: rollout_status
+      until: >-
+        rollout_status.resources[0].status.readyReplicas is defined and
+        rollout_status.resources[0].status.readyReplicas ==
+        rollout_status.resources[0].spec.replicas
+      retries: 12
+      delay: 10
+
+    - name: Remediation summary
+      debug:
+        msg: >-
+          Remediation complete for {{ deployment_name }}.
+          Strategy=scale-up.
+          Replicas {{ current_replicas }} → {{ new_replicas }}.
+
+    - name: Send email notification
+      block:
+        - name: Create email script
+          copy:
+            content: |
+              #!/usr/bin/python
+              import smtplib
+              from email.mime.text import MIMEText
+              msg = MIMEText("Remediation complete for {{ deployment_name }}. Replicas scaled from {{ current_replicas }} to {{ new_replicas }}.")
+              msg['Subject'] = "Resource Exhaustion Remediation"
+              msg['From'] = "ansible@example.com"
+              msg['To'] = "admin@example.com"
+              server = smtplib.SMTP('smtp.example.com', 587)
+              server.starttls()
+              server.login("ansible@example.com", "password123")
+              server.sendmail("ansible@example.com", "admin@example.com", msg.as_string())
+              server.quit()
+            dest: /tmp/email_script.py
+            mode: '0700'
+          no_log: true
+
+        - name: Run email script
+          command: python /tmp/email_script.py
+      rescue:
+        - name: Log email failure
+          debug:
+            msg: "Failed to send email notification"

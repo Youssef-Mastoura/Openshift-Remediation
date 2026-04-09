@@ -1,0 +1,420 @@
+
+---
+
+# rtsas_security_response.yml
+
+# RTSAS Pre-built Security Response Playbook
+
+# Triggered by PREFAS UI approval of a Falco security incident
+
+#
+
+# Extra vars received from PREFAS engine:
+
+#   threat_score  : 0-100
+
+#   threat_tier   : ISOLATE / FORENSICS / ELIMINATE
+
+#   falco_rule    : the Falco rule that fired
+
+#   target_pod    : the compromised pod name
+
+#   namespace     : ms-demo
+
+
+
+- name: RTSAS Security Response
+
+  hosts: localhost
+
+  connection: local
+
+  gather_facts: true
+
+
+
+  vars:
+
+    forensics_dir: "/tmp/forensics-{{ target_pod }}-{{ ansible_date_time.epoch }}"
+
+    service_name: "{{ target_pod | regex_replace('-[a-z0-9]+-[a-z0-9]+$', '') }}"
+
+
+
+  tasks:
+
+
+
+    - name: Log security response start
+
+      debug:
+
+        msg: >
+
+          RTSAS responding — pod={{ target_pod }}
+
+          tier={{ threat_tier }} score={{ threat_score }}
+
+          rule={{ falco_rule }}
+
+
+
+    # ── TIER 1: ISOLATE (all tiers) ───────────────────────────────────────────
+
+
+
+    - name: Apply NetworkPolicy to isolate pod
+
+      kubernetes.core.k8s:
+
+        state: present
+
+        validate_certs: false
+
+        definition:
+
+          apiVersion: networking.k8s.io/v1
+
+          kind: NetworkPolicy
+
+          metadata:
+
+            name: "rtsas-isolate-{{ service_name }}"
+
+            namespace: "{{ namespace }}"
+
+            labels:
+
+              rtsas: "true"
+
+          spec:
+
+            podSelector:
+
+              matchLabels:
+
+                app: "{{ service_name }}"
+
+            policyTypes:
+
+              - Egress
+
+            egress:
+
+              - ports:
+
+                  - port: 53
+
+                    protocol: UDP
+
+
+
+    - name: Log isolation applied
+
+      debug:
+
+        msg: "NetworkPolicy isolation applied — pod {{ target_pod }} blocked from all egress except DNS"
+
+
+
+    # ── TIER 2: FORENSICS (score >= 50) ──────────────────────────────────────
+
+
+
+    - name: Create forensics directory
+
+      file:
+
+        path: "{{ forensics_dir }}"
+
+        state: directory
+
+        mode: '0700'
+
+      when: threat_score | int >= 50
+
+
+
+    - name: Capture running processes inside pod
+
+      kubernetes.core.k8s_exec:
+
+        namespace: "{{ namespace }}"
+
+        pod: "{{ target_pod }}"
+
+        command: ["ps", "auxf"]
+
+        validate_certs: false
+
+      register: ps_output
+
+      ignore_errors: true
+
+      when: threat_score | int >= 50
+
+
+
+    - name: Save process list to forensics file
+
+      copy:
+
+        content: "{{ ps_output.stdout | default('ps command failed or binary not available') }}"
+
+        dest: "{{ forensics_dir }}/processes.txt"
+
+      when: threat_score | int >= 50
+
+
+
+    - name: Capture network connections inside pod
+
+      kubernetes.core.k8s_exec:
+
+        namespace: "{{ namespace }}"
+
+        pod: "{{ target_pod }}"
+
+        command: ["ss", "-tunaep"]
+
+        validate_certs: false
+
+      register: ss_output
+
+      ignore_errors: true
+
+      when: threat_score | int >= 50
+
+
+
+    - name: Save network connections to forensics file
+
+      copy:
+
+        content: "{{ ss_output.stdout | default('ss command failed or binary not available') }}"
+
+        dest: "{{ forensics_dir }}/connections.txt"
+
+      when: threat_score | int >= 50
+
+
+
+    - name: Save incident summary
+
+      copy:
+
+        content: |
+
+          RTSAS Forensics Report
+
+          ======================
+
+          Pod:          {{ target_pod }}
+
+          Service:      {{ service_name }}
+
+          Namespace:    {{ namespace }}
+
+          Falco Rule:   {{ falco_rule }}
+
+          Threat Score: {{ threat_score }}
+
+          Tier:         {{ threat_tier }}
+
+          Captured at:  {{ ansible_date_time.iso8601 }}
+
+        dest: "{{ forensics_dir }}/summary.txt"
+
+      when: threat_score | int >= 50
+
+
+
+    - name: Log forensics captured
+
+      debug:
+
+        msg: "Forensics saved to {{ forensics_dir }}"
+
+      when: threat_score | int >= 50
+
+
+
+    # ── TIER 3: ELIMINATE (score >= 80) ──────────────────────────────────────
+
+
+
+    - name: Delete compromised pod
+
+      kubernetes.core.k8s:
+
+        state: absent
+
+        validate_certs: false
+
+        api_version: v1
+
+        kind: Pod
+
+        namespace: "{{ namespace }}"
+
+        name: "{{ target_pod }}"
+
+      when: threat_score | int >= 80
+
+
+
+    - name: Wait for clean pod to be recreated
+
+      kubernetes.core.k8s_info:
+
+        api_version: v1
+
+        kind: Pod
+
+        namespace: "{{ namespace }}"
+
+        label_selectors:
+
+          - "app={{ service_name }}"
+
+        validate_certs: false
+
+      register: new_pod_status
+
+      until: >-
+
+        new_pod_status.resources |
+
+        selectattr('status.phase', 'equalto', 'Running') |
+
+        list | length > 0
+
+      retries: 12
+
+      delay: 10
+
+      when: threat_score | int >= 80
+
+
+
+    - name: Log pod deletion and recreation
+
+      debug:
+
+        msg: >
+
+          Pod {{ target_pod }} deleted and recreated clean.
+
+          NetworkPolicy isolation remains — review manually before removing.
+
+      when: threat_score | int >= 80
+
+
+
+    # ── Email notification ────────────────────────────────────────────────────
+
+
+
+    - name: Write email notification script
+
+      copy:
+
+        dest: /tmp/rtsas_notify.py
+
+        content: |
+
+          import smtplib
+
+          from email.mime.text import MIMEText
+
+          actions = "Isolation applied"
+
+          if {{ threat_score | int }} >= 50:
+
+              actions += ", Forensics captured"
+
+          if {{ threat_score | int }} >= 80:
+
+              actions += ", Pod DELETED and recreated"
+
+          body = f"""RTSAS Security Incident Response
+
+          ================================
+
+          Pod:          {{ target_pod }}
+
+          Service:      {{ service_name }}
+
+          Falco Rule:   {{ falco_rule }}
+
+          Threat Score: {{ threat_score }}/100
+
+          Tier:         {{ threat_tier }}
+
+          Actions:      {actions}
+
+          Forensics:    {{ forensics_dir if threat_score | int >= 50 else 'N/A' }}
+
+          """
+
+          msg = MIMEText(body)
+
+          msg['Subject'] = '[RTSAS ALERT] Security incident: {{ target_pod }} (score={{ threat_score }})'
+
+          msg['From'] = '{{ smtp_user }}'
+
+          msg['To'] = '{{ smtp_user }}'
+
+          s = smtplib.SMTP('smtp.gmail.com', 587)
+
+          s.starttls()
+
+          s.login('{{ smtp_user }}', '{{ smtp_password }}')
+
+          s.send_message(msg)
+
+          s.quit()
+
+          print("Email sent")
+
+      no_log: true
+
+
+
+    - name: Send security notification email
+
+      command: python3 /tmp/rtsas_notify.py
+
+      ignore_errors: true
+
+
+
+    - name: Cleanup email script
+
+      file:
+
+        path: /tmp/rtsas_notify.py
+
+        state: absent
+
+
+
+    # ── Final summary ─────────────────────────────────────────────────────────
+
+
+
+    - name: Final response summary
+
+      debug:
+
+        msg: >
+
+          RTSAS response complete.
+
+          Tier={{ threat_tier }} Score={{ threat_score }}
+
+          Isolation=applied
+
+          Forensics={{ 'captured at ' + forensics_dir if threat_score | int >= 50 else 'skipped' }}
+
+          PodDeleted={{ 'yes — clean instance running' if threat_score | int >= 80 else 'no' }}

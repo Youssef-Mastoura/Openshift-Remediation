@@ -66,11 +66,11 @@
         mode: '0700'
       when: threat_score | int >= 50
 
-    - name: Capture process info from /proc/1/status
+    - name: Capture process info from pod
       kubernetes.core.k8s_exec:
         namespace: "{{ namespace }}"
         pod: "{{ target_pod }}"
-        command: ["cat", "/proc/1/status"]
+        command: cat /proc/1/status
         validate_certs: false
       register: ps_output
       ignore_errors: true
@@ -82,11 +82,11 @@
         dest: "{{ forensics_dir }}/processes.txt"
       when: threat_score | int >= 50
 
-    - name: Capture network connections from /proc/net/tcp
+    - name: Capture network connections from pod
       kubernetes.core.k8s_exec:
         namespace: "{{ namespace }}"
         pod: "{{ target_pod }}"
-        command: ["cat", "/proc/net/tcp"]
+        command: cat /proc/net/tcp
         validate_certs: false
       register: net_output
       ignore_errors: true

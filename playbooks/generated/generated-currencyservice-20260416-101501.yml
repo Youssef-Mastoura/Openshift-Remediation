@@ -1,0 +1,105 @@
+---
+- name: Remediate currencyservice resource exhaustion
+  hosts: localhost
+  connection: local
+  gather_facts: true
+
+  vars:
+    pod_name: "{{ event_data.pod }}"
+    namespace: "{{ event_data.namespace }}"
+    deployment_name: "{{ pod_name | regex_replace('-[a-z0-9]+-[a-z0-9]+$', '') }}"
+
+  tasks:
+  - name: Get current deployment spec
+    kubernetes.core.k8s_info:
+      api_version: apps/v1
+      kind: Deployment
+      name: "{{ deployment_name }}"
+      namespace: "{{ namespace }}"
+      validate_certs: false
+    register: deployment_info
+
+  - name: Extract current values
+    set_fact:
+      current_replicas: "{{ deployment_info.resources[0].spec.replicas | int }}"
+      current_image: >-
+        {{ deployment_info.resources[0].spec.template.spec.containers[0].image }}
+      current_memory: >-
+        {{ deployment_info.resources[0].spec.template.spec.containers[0]
+           .resources.limits.memory | default('256Mi') }}
+
+  - name: Scale up replicas to distribute load
+    kubernetes.core.k8s_scale:
+      api_version: apps/v1
+      kind: Deployment
+      name: "{{ deployment_name }}"
+      namespace: "{{ namespace }}"
+      replicas: "{{ (current_replicas | int * 1.5) | round(0, 'ceil') | int }}"
+      validate_certs: false
+
+  - name: Increase memory limit by 50 percent
+    kubernetes.core.k8s:
+      api_version: apps/v1
+      kind: Deployment
+      name: "{{ deployment_name }}"
+      namespace: "{{ namespace }}"
+      definition:
+        spec:
+          template:
+            spec:
+              containers:
+                - name: "{{ deployment_name }}"
+                  resources:
+                    limits:
+                      memory: >-
+                        {{ (current_memory | regex_replace('[^0-9]', '') | int * 1.5)
+                           | round(0, 'ceil') | int }}Mi
+                    requests:
+                      memory: >-
+                        {{ (current_memory | regex_replace('[^0-9]', '') | int * 0.75)
+                           | round(0, 'ceil') | int }}Mi
+      validate_certs: false
+
+  - name: Wait for deployment to stabilize
+    kubernetes.core.k8s_info:
+      api_version: apps/v1
+      kind: Deployment
+      name: "{{ deployment_name }}"
+      namespace: "{{ namespace }}"
+      validate_certs: false
+    register: rollout_status
+    until: >-
+      rollout_status.resources[0].status.readyReplicas is defined and
+      rollout_status.resources[0].status.readyReplicas ==
+      rollout_status.resources[0].spec.replicas
+    retries: 18
+    delay: 10
+
+  - name: Write email notification script
+    ansible.builtin.copy:
+      dest: /tmp/prefas_notify_{{ deployment_name }}.py
+      content: |
+        import smtplib
+        from email.mime.text import MIMEText
+        body = (
+          'PREFAS Remediation Report\n'
+          'Service:   {{ deployment_name }}\n'
+          'Namespace: {{ namespace }}\n'
+          'Action:    Scaled up replicas by 50% and increased memory limit by 50%\n'
+          'Time:      {{ ansible_date_time.iso8601 }}\n'
+        )
+        msg = MIMEText(body)
+        msg['Subject'] = '[PREFAS] Remediation: {{ deployment_name }}'
+        msg['From'] = '{{ smtp_user }}'
+        msg['To']   = '{{ smtp_user }}'
+        s = smtplib.SMTP('smtp.gmail.com', 587)
+        s.starttls()
+        s.login('{{ smtp_user }}', '{{ smtp_password }}')
+        s.send_message(msg)
+        s.quit()
+    no_log: true
+
+  - name: Send notification
+    ansible.builtin.command: >-
+      python3 /tmp/prefas_notify_{{ deployment_name }}.py
+    ignore_errors: true

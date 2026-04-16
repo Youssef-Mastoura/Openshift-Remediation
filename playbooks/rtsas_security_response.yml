@@ -63,7 +63,10 @@
       kubernetes.core.k8s_exec:
         namespace: "{{ namespace }}"
         pod: "{{ target_pod }}"
-        command: ["/bin/sh", "-c", "ps auxf 2>/dev/null || cat /proc/1/status"]
+        command:
+          - /bin/sh
+          - -c
+          - "ps auxf 2>/dev/null || cat /proc/1/status"
         validate_certs: false
       register: ps_output
       ignore_errors: true
@@ -79,7 +82,10 @@
       kubernetes.core.k8s_exec:
         namespace: "{{ namespace }}"
         pod: "{{ target_pod }}"
-        command: ["/bin/sh", "-c", "netstat -tunaep 2>/dev/null || cat /proc/net/tcp"]
+        command:
+          - /bin/sh
+          - -c
+          - "netstat -tunaep 2>/dev/null || cat /proc/net/tcp"
         validate_certs: false
       register: ss_output
       ignore_errors: true

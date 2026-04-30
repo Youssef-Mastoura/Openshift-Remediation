@@ -719,7 +719,7 @@
     - name: "[VERIFY] Fetch pod list after recreation"
       k8s_info: ...
       register: new_pods_verify
-      until: >-                        ← added retry loop
+      until: >-
         new_pods_verify.resources |
         rejectattr('metadata.name', 'equalto', target_pod) |
         selectattr('status.phase', 'equalto', 'Running') |

@@ -381,14 +381,11 @@
 
     - name: "[LOKI] Query application logs for last 30 minutes"
       ansible.builtin.uri:
-        url: "{{ loki_url }}/loki/api/v1/query_range"
+        url: "{{ loki_url }}/loki/api/v1/query_range?query=%7Bnamespace%3D%22{{ loki_namespace }}%22%2Cpod%3D%22{{ target_pod }}%22%7D&start={{ (ansible_date_time.epoch | int - 1800) }}000000000&end={{ ansible_date_time.epoch }}000000000&limit=200&direction=backward"
         method: GET
         validate_certs: false
         return_content: true
         timeout: 20
-        body_format: form-urlencoded
-        body: >-
-          query={namespace="{{ loki_namespace }}",pod="{{ target_pod }}"}&start={{ (ansible_date_time.epoch | int - 1800) }}000000000&end={{ ansible_date_time.epoch }}000000000&limit=200&direction=backward
       register: loki_response
       ignore_errors: true
       when: threat_score | int >= 50

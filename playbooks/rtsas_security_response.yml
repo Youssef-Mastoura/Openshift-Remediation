@@ -711,21 +711,20 @@
 #   security reviewers and juries look for in incident documentation.
 # =============================================================================
 
-    - name: "[VERIFY] Pause 10s for new pod phase to stabilize"
+    - name: "[VERIFY] Pause 30s for new pod to reach Running phase"
       ansible.builtin.pause:
-        seconds: 20
+        seconds: 30
       when: threat_score | int >= 80
 
     - name: "[VERIFY] Fetch pod list after recreation"
-      k8s_info: ...
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Pod
+        namespace: "{{ namespace }}"
+        label_selectors:
+          - "app={{ service_name }}"
+        validate_certs: false
       register: new_pods_verify
-      until: >-
-        new_pods_verify.resources |
-        rejectattr('metadata.name', 'equalto', target_pod) |
-        selectattr('status.phase', 'equalto', 'Running') |
-        list | length > 0
-      retries: 6
-      delay: 10
       when: threat_score | int >= 80
 
     - name: "[VERIFY] Identify the new clean pod"

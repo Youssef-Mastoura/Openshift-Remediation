@@ -713,18 +713,19 @@
 
     - name: "[VERIFY] Pause 10s for new pod phase to stabilize"
       ansible.builtin.pause:
-        seconds: 10
+        seconds: 20
       when: threat_score | int >= 80
 
     - name: "[VERIFY] Fetch pod list after recreation"
-      kubernetes.core.k8s_info:
-        api_version: v1
-        kind: Pod
-        namespace: "{{ namespace }}"
-        label_selectors:
-          - "app={{ service_name }}"
-        validate_certs: false
+      k8s_info: ...
       register: new_pods_verify
+      until: >-                        ← added retry loop
+        new_pods_verify.resources |
+        rejectattr('metadata.name', 'equalto', target_pod) |
+        selectattr('status.phase', 'equalto', 'Running') |
+        list | length > 0
+      retries: 6
+      delay: 10
       when: threat_score | int >= 80
 
     - name: "[VERIFY] Identify the new clean pod"
